@@ -1,0 +1,2995 @@
+from flask import (Flask, render_template_string, request, redirect,
+                   url_for, flash, session, send_file, abort, jsonify)
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta, date, time
+from sqlalchemy import func, or_
+from functools import wraps
+from io import BytesIO
+import random
+import copy
+
+# openpyxl для экспорта в Excel
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'beauty-salon-secret-key-2026'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///salon.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+
+# ============ МОДЕЛИ ============
+
+master_services = db.Table(
+    'master_services',
+    db.Column('master_id', db.Integer, db.ForeignKey('master.id'), primary_key=True),
+    db.Column('service_id', db.Integer, db.ForeignKey('service.id'), primary_key=True)
+)
+
+
+class User(db.Model):
+    """Аккаунт для входа. Один user = один мастер ИЛИ один клиент ИЛИ админ."""
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.String(20), nullable=False)  # admin / master / client
+    master_id = db.Column(db.Integer, db.ForeignKey('master.id'), nullable=True)
+    client_id = db.Column(db.Integer, db.ForeignKey('client.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+
+class Master(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    first_name = db.Column(db.String(60), nullable=False)
+    last_name = db.Column(db.String(60), nullable=False)
+    phone = db.Column(db.String(20))
+    email = db.Column(db.String(100))
+    work_start = db.Column(db.Time, default=time(9, 0))
+    work_end = db.Column(db.Time, default=time(20, 0))
+    bio = db.Column(db.Text)
+    services = db.relationship('Service', secondary=master_services,
+                               backref=db.backref('masters', lazy='dynamic'))
+    appointments = db.relationship('Appointment', backref='master', lazy=True)
+    schedules = db.relationship('Schedule', backref='master', lazy=True,
+                                cascade='all, delete-orphan')
+    user = db.relationship('User', backref='master_profile', uselist=False,
+                           foreign_keys=[User.master_id])
+
+    @property
+    def full_name(self):
+        return f'{self.last_name} {self.first_name}'.strip()
+
+    @property
+    def rating(self):
+        """Средний рейтинг мастера по всем оценкам."""
+        reviews = Review.query.join(Appointment).filter(
+            Appointment.master_id == self.id
+        ).all()
+        if not reviews:
+            return 0.0
+        return round(sum(r.rating for r in reviews) / len(reviews), 2)
+
+    @property
+    def reviews_count(self):
+        return Review.query.join(Appointment).filter(
+            Appointment.master_id == self.id
+        ).count()
+
+    def is_working_on(self, target_date):
+        """Работает ли мастер в этот день (с учётом отпуска/выходного)."""
+        sched = Schedule.query.filter_by(master_id=self.id, work_date=target_date).first()
+        if sched and sched.day_type in ('vacation', 'sick', 'dayoff'):
+            return False
+        return True
+
+    def hours_for_date(self, target_date):
+        """Часы работы для конкретной даты (с учётом индивидуального расписания)."""
+        sched = Schedule.query.filter_by(master_id=self.id, work_date=target_date).first()
+        if sched and sched.day_type == 'work' and sched.custom_start and sched.custom_end:
+            return sched.custom_start, sched.custom_end
+        return self.work_start, self.work_end
+
+
+class Client(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    first_name = db.Column(db.String(60), nullable=False)
+    last_name = db.Column(db.String(60), nullable=False)
+    phone = db.Column(db.String(20))
+    email = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    appointments = db.relationship('Appointment', backref='client', lazy=True)
+    user = db.relationship('User', backref='client_profile', uselist=False,
+                           foreign_keys=[User.client_id])
+
+    @property
+    def full_name(self):
+        return f'{self.last_name} {self.first_name}'.strip()
+
+
+class Service(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    duration = db.Column(db.Integer, nullable=False)  # минут
+    price = db.Column(db.Float, nullable=False)
+    appointments = db.relationship('Appointment', backref='service', lazy=True)
+
+
+class Appointment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    client_id = db.Column(db.Integer, db.ForeignKey('client.id'), nullable=False)
+    master_id = db.Column(db.Integer, db.ForeignKey('master.id'), nullable=False)
+    service_id = db.Column(db.Integer, db.ForeignKey('service.id'), nullable=False)
+    start_time = db.Column(db.DateTime, nullable=False)
+    end_time = db.Column(db.DateTime, nullable=False)
+    status = db.Column(db.String(20), default='active')  # active / cancelled / completed
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    review = db.relationship('Review', backref='appointment', uselist=False,
+                             cascade='all, delete-orphan')
+
+
+class Review(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    appointment_id = db.Column(db.Integer, db.ForeignKey('appointment.id'),
+                               nullable=False, unique=True)
+    rating = db.Column(db.Integer, nullable=False)  # 1..5
+    comment = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class Schedule(db.Model):
+    """Учёт рабочего времени мастеров: отпуска, выходные, индивидуальный график."""
+    id = db.Column(db.Integer, primary_key=True)
+    master_id = db.Column(db.Integer, db.ForeignKey('master.id'), nullable=False)
+    work_date = db.Column(db.Date, nullable=False)
+    day_type = db.Column(db.String(20), nullable=False)  # work / vacation / sick / dayoff
+    custom_start = db.Column(db.Time)
+    custom_end = db.Column(db.Time)
+    note = db.Column(db.String(255))
+
+
+# ============ АЛГОРИТМЫ ОПТИМИЗАЦИИ ============
+
+def find_optimal_master(service_id, start_time, end_time):
+    """
+    Жадный алгоритм автоподбора. Выбирает мастера по комбинированному score:
+    score = rating_weight * normalized_rating - load_weight * normalized_load
+    Чем выше — тем лучше. Так система отдаёт предпочтение более рейтинговым,
+    но не нагружает одного и того же сильнее, чем нужно.
+    """
+    service = Service.query.get(service_id)
+    if not service:
+        return None
+
+    target_date = start_time.date()
+    candidates = []
+
+    for master in service.masters:
+        # отпуск/выходной
+        if not master.is_working_on(target_date):
+            continue
+        ws, we = master.hours_for_date(target_date)
+        if start_time.time() < ws or end_time.time() > we:
+            continue
+        # пересечение с другой записью
+        conflict = Appointment.query.filter(
+            Appointment.master_id == master.id,
+            Appointment.status == 'active',
+            Appointment.start_time < end_time,
+            Appointment.end_time > start_time
+        ).first()
+        if conflict:
+            continue
+        # загрузка за день
+        day_start = datetime.combine(target_date, time.min)
+        day_end = datetime.combine(target_date, time.max)
+        load = Appointment.query.filter(
+            Appointment.master_id == master.id,
+            Appointment.status == 'active',
+            Appointment.start_time >= day_start,
+            Appointment.start_time <= day_end
+        ).count()
+        candidates.append({'master': master, 'load': load, 'rating': master.rating})
+
+    if not candidates:
+        return None
+
+    max_load = max(c['load'] for c in candidates) or 1
+    # score: рейтинг важнее (вес 0.7), но равномерность загрузки тоже учитывается (0.3)
+    for c in candidates:
+        norm_rating = c['rating'] / 5.0  # 0..1
+        norm_load = c['load'] / max_load  # 0..1
+        # для мастеров без отзывов рейтинг считаем средним 3.5/5
+        if c['rating'] == 0:
+            norm_rating = 0.7
+        c['score'] = 0.7 * norm_rating - 0.3 * norm_load
+
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    return candidates[0]['master']
+
+
+def is_master_available(master_id, start_time, end_time):
+    """Проверка занятости + работает ли мастер в этот день."""
+    master = Master.query.get(master_id)
+    if not master:
+        return False
+    target_date = start_time.date()
+    if not master.is_working_on(target_date):
+        return False
+    ws, we = master.hours_for_date(target_date)
+    if start_time.time() < ws or end_time.time() > we:
+        return False
+    conflict = Appointment.query.filter(
+        Appointment.master_id == master_id,
+        Appointment.status == 'active',
+        Appointment.start_time < end_time,
+        Appointment.end_time > start_time
+    ).first()
+    return conflict is None
+
+
+# ---- Генетический алгоритм оптимизации дневного расписания ----
+
+class GeneticScheduler:
+    """
+    Генетический алгоритм для оптимального распределения списка заявок
+    (services) по мастерам и времени в течение одного дня.
+
+    Хромосома — список генов: gene[i] = (master_id, start_minutes_from_day_start)
+    для i-й заявки. Длина = число заявок.
+
+    Fitness складывается из:
+      + бонус за качество назначения (рейтинг подходящего мастера)
+      − штраф за конфликт времени у мастера
+      − штраф за выход за рабочие часы / отпуск
+      − штраф за недопустимую услугу (мастер не оказывает)
+      − штраф за неравномерность загрузки (стандартное отклонение)
+    """
+
+    def __init__(self, requests, target_date,
+                 population_size=30, generations=50,
+                 mutation_rate=0.15, elitism=2):
+        """
+        requests: список dict {service_id, duration} — заявки на день
+        target_date: date — целевой день
+        """
+        self.requests = requests
+        self.target_date = target_date
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.elitism = elitism
+
+        # подготовим список доступных мастеров для каждой заявки
+        self.eligible = []
+        for req in requests:
+            service = Service.query.get(req['service_id'])
+            if service:
+                masters = [m for m in service.masters if m.is_working_on(target_date)]
+                self.eligible.append(masters)
+            else:
+                self.eligible.append([])
+
+        # рабочие часы дня (минут с начала дня)
+        self.day_start_min = 9 * 60   # 09:00
+        self.day_end_min = 20 * 60    # 20:00
+
+        self.history = []  # для графика сходимости
+
+    def random_gene(self, idx):
+        """Случайный ген для заявки idx."""
+        masters = self.eligible[idx]
+        if not masters:
+            return (None, self.day_start_min)
+        master = random.choice(masters)
+        duration = self.requests[idx]['duration']
+        # рабочие часы конкретного мастера
+        ws, we = master.hours_for_date(self.target_date)
+        ws_min = ws.hour * 60 + ws.minute
+        we_min = we.hour * 60 + we.minute
+        latest_start = max(ws_min, we_min - duration)
+        # снэппим к 5-минутной сетке
+        slot = random.randrange(ws_min, max(ws_min + 1, latest_start + 1), 5) \
+            if latest_start > ws_min else ws_min
+        return (master.id, slot)
+
+    def random_individual(self):
+        return [self.random_gene(i) for i in range(len(self.requests))]
+
+    def fitness(self, individual):
+        score = 0.0
+        master_intervals = {}  # master_id -> list[(start, end)]
+        master_load = {}       # master_id -> count
+
+        for i, gene in enumerate(individual):
+            master_id, start_min = gene
+            if master_id is None:
+                score -= 100  # нет мастера для услуги
+                continue
+            master = Master.query.get(master_id)
+            req = self.requests[i]
+            duration = req['duration']
+            end_min = start_min + duration
+
+            # услуга должна быть в репертуаре
+            service = Service.query.get(req['service_id'])
+            if service not in master.services:
+                score -= 80
+                continue
+
+            # рабочие часы
+            ws, we = master.hours_for_date(self.target_date)
+            ws_min = ws.hour * 60 + ws.minute
+            we_min = we.hour * 60 + we.minute
+            if start_min < ws_min or end_min > we_min:
+                score -= 50
+                continue
+
+            # конфликт с другими генами того же мастера
+            existing = master_intervals.setdefault(master_id, [])
+            overlap = any(not (end_min <= s or start_min >= e) for s, e in existing)
+            if overlap:
+                score -= 60
+            else:
+                existing.append((start_min, end_min))
+                # бонус за рейтинг (если 0 — нейтрально)
+                rating = master.rating or 3.5
+                score += rating * 5
+                master_load[master_id] = master_load.get(master_id, 0) + 1
+
+        # выравнивание загрузки: меньшая дисперсия = лучше
+        if master_load:
+            loads = list(master_load.values())
+            mean = sum(loads) / len(loads)
+            variance = sum((x - mean) ** 2 for x in loads) / len(loads)
+            score -= variance * 2
+
+        return score
+
+    def crossover(self, p1, p2):
+        if len(p1) < 2:
+            return p1[:]
+        point = random.randint(1, len(p1) - 1)
+        return p1[:point] + p2[point:]
+
+    def mutate(self, individual):
+        new = individual[:]
+        for i in range(len(new)):
+            if random.random() < self.mutation_rate:
+                new[i] = self.random_gene(i)
+        return new
+
+    def select(self, population, fitnesses):
+        """Турнирный отбор."""
+        k = 3
+        contenders = random.sample(list(zip(population, fitnesses)), min(k, len(population)))
+        contenders.sort(key=lambda x: x[1], reverse=True)
+        return contenders[0][0]
+
+    def run(self):
+        if not self.requests:
+            return [], 0, []
+        # начальная популяция
+        population = [self.random_individual() for _ in range(self.population_size)]
+
+        best_ever = None
+        best_score = float('-inf')
+
+        for gen in range(self.generations):
+            fitnesses = [self.fitness(ind) for ind in population]
+            # элитизм
+            paired = sorted(zip(population, fitnesses), key=lambda x: x[1], reverse=True)
+            elites = [copy.deepcopy(ind) for ind, _ in paired[:self.elitism]]
+
+            if paired[0][1] > best_score:
+                best_score = paired[0][1]
+                best_ever = copy.deepcopy(paired[0][0])
+
+            self.history.append(round(paired[0][1], 2))
+
+            # новое поколение
+            new_pop = elites[:]
+            while len(new_pop) < self.population_size:
+                p1 = self.select(population, fitnesses)
+                p2 = self.select(population, fitnesses)
+                child = self.crossover(p1, p2)
+                child = self.mutate(child)
+                new_pop.append(child)
+            population = new_pop
+
+        return best_ever, best_score, self.history
+
+
+# ============ АУТЕНТИФИКАЦИЯ ============
+
+def current_user():
+    uid = session.get('user_id')
+    if uid:
+        return User.query.get(uid)
+    return None
+
+
+def login_required(role=None):
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            user = current_user()
+            if not user:
+                flash('Войдите в систему', 'error')
+                return redirect(url_for('login'))
+            if role:
+                roles = role if isinstance(role, (list, tuple)) else [role]
+                if user.role not in roles:
+                    flash('Нет доступа', 'error')
+                    return redirect(url_for('index'))
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+@app.context_processor
+def inject_user():
+    return {'current_user': current_user()}
+
+
+# ============ HTML / CSS ============
+
+BASE_CSS = r"""
+<style>
+  :root {
+    --bg: #0f0d1a;
+    --bg-soft: #181429;
+    --surface: rgba(28, 23, 49, 0.7);
+    --surface-solid: #1c1731;
+    --border: rgba(212, 175, 55, 0.18);
+    --gold: #d4af37;
+    --gold-soft: #e8c97a;
+    --rose: #e8a4b8;
+    --text: #ece7e0;
+    --muted: #8b8499;
+    --danger: #ff5c7c;
+    --success: #4dd4a8;
+    --info: #8ab4ff;
+  }
+  /* Светлая тема — переопределяем те же переменные */
+  html[data-theme="light"] {
+    --bg: #f6f3ee;
+    --bg-soft: #efe9df;
+    --surface: rgba(255, 255, 255, 0.78);
+    --surface-solid: #ffffff;
+    --border: rgba(180, 140, 40, 0.28);
+    --gold: #a8842a;
+    --gold-soft: #8a6d22;
+    --rose: #c77d92;
+    --text: #2a2533;
+    --muted: #6b6478;
+    --danger: #d63a5c;
+    --success: #1f9e78;
+    --info: #3f6fd1;
+    /* Добавь эти переменные для хэдера в светлой теме */
+    --navbar-bg: rgba(255, 255, 255, 0.92);
+    --navbar-border: rgba(168, 132, 42, 0.35);
+}
+  html { transition: background 0.3s ease; }
+  body, .navbar, .card, .btn, td, input, select, textarea { transition: background 0.3s ease, color 0.3s ease, border-color 0.3s ease; }
+
+  /* Кнопка переключения темы */
+  .theme-toggle {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 38px; height: 38px; border-radius: 999px;
+    background: rgba(212,175,55,0.12); color: var(--gold-soft);
+    border: 1px solid var(--border); cursor: pointer;
+    font-size: 17px; line-height: 1; transition: all 0.2s;
+  }
+  .theme-toggle:hover { background: rgba(212,175,55,0.22); color: var(--gold); }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--text); }
+  body {
+    font-family: 'Inter', 'Segoe UI', Tahoma, sans-serif;
+    line-height: 1.6;
+    min-height: 100vh;
+    background:
+      radial-gradient(ellipse at top right, rgba(212,175,55,0.08), transparent 60%),
+      radial-gradient(ellipse at bottom left, rgba(232,164,184,0.06), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
+  }
+  a { color: var(--gold-soft); text-decoration: none; }
+  a:hover { color: var(--gold); }
+
+  /* NAVBAR */
+  .navbar {
+    background: rgba(15, 13, 26, 0.85);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 30px;
+    position: sticky; top: 0; z-index: 100;
+  }
+  .navbar-content {
+    max-width: 1280px; margin: 0 auto;
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 14px;
+  }
+
+  html[data-theme="light"] .navbar {
+    background: var(--navbar-bg);
+    border-bottom: 1px solid var(--navbar-border);
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+}
+  .logo {
+    color: var(--gold); font-size: 22px; font-weight: 700;
+    letter-spacing: 0.5px; text-decoration: none;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .logo .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--gold), var(--rose));
+    box-shadow: 0 0 12px var(--gold);
+  }
+  .nav-links { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+  .nav-links a {
+    color: var(--text); padding: 8px 14px; border-radius: 8px;
+    transition: all 0.2s; font-size: 14px;
+  }
+  .nav-links a:hover { background: rgba(212,175,55,0.12); color: var(--gold-soft); }
+  .nav-user {
+    display: flex; align-items: center; gap: 10px;
+    padding-left: 14px; border-left: 1px solid var(--border);
+  }
+  .nav-user .who { color: var(--muted); font-size: 13px; }
+  .nav-user .who strong { color: var(--gold-soft); }
+  .role-pill {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px;
+    background: rgba(212,175,55,0.15); color: var(--gold);
+    border: 1px solid var(--border);
+  }
+  .role-pill.client { background: rgba(232,164,184,0.12); color: var(--rose); border-color: rgba(232,164,184,0.25); }
+  .role-pill.master { background: rgba(138,180,255,0.12); color: var(--info); border-color: rgba(138,180,255,0.25); }
+
+  /* CONTAINER */
+  .container { max-width: 1280px; margin: 32px auto; padding: 0 24px; }
+  h1 {
+    font-size: 30px; font-weight: 700; color: var(--text);
+    margin-bottom: 6px; letter-spacing: -0.4px;
+  }
+  h1 .accent { color: var(--gold); }
+  .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 14px; }
+  h2 { color: var(--text); margin-bottom: 16px; font-size: 18px; font-weight: 600; }
+
+  /* CARD */
+  .card {
+    background: var(--surface);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 26px;
+    margin-bottom: 22px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+  }
+  .card.compact { padding: 18px; }
+
+  /* BUTTONS */
+  .btn {
+    display: inline-block; padding: 10px 20px;
+    background: linear-gradient(135deg, var(--gold) 0%, var(--gold-soft) 100%);
+    color: #1a1428; border: none; border-radius: 10px;
+    cursor: pointer; text-decoration: none; font-size: 14px; font-weight: 600;
+    transition: all 0.2s; letter-spacing: 0.2px;
+  }
+  .btn:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(212,175,55,0.25); color: #1a1428; }
+  .btn-outline {
+    background: transparent; color: var(--gold-soft);
+    border: 1px solid var(--border);
+  }
+  .btn-outline:hover { background: rgba(212,175,55,0.08); color: var(--gold); }
+  .btn-danger { background: linear-gradient(135deg, var(--danger), #d94668); color: white; }
+  .btn-danger:hover { box-shadow: 0 6px 20px rgba(255,92,124,0.3); color: white; }
+  .btn-success { background: linear-gradient(135deg, var(--success), #2ea889); color: #0a1f17; }
+  .btn-success:hover { box-shadow: 0 6px 20px rgba(77,212,168,0.3); color: #0a1f17; }
+  .btn-grey { background: rgba(139,132,153,0.2); color: var(--text); border: 1px solid var(--border); }
+  .btn-grey:hover { background: rgba(139,132,153,0.3); color: var(--text); }
+  .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 6px; }
+
+  /* FORMS */
+  .form-group { margin-bottom: 16px; }
+  label {
+    display: block; margin-bottom: 6px; font-weight: 500;
+    color: var(--gold-soft); font-size: 13px; letter-spacing: 0.3px;
+  }
+  input, select, textarea {
+    width: 100%; padding: 11px 14px;
+    background: rgba(15,13,26,0.6);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text); font-size: 14px;
+    font-family: inherit;
+    transition: all 0.2s;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--gold);
+    box-shadow: 0 0 0 3px rgba(212,175,55,0.12);
+  }
+  input::placeholder { color: rgba(139,132,153,0.6); }
+  select option { background: var(--surface-solid); color: var(--text); }
+
+  /* TABLE */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    padding: 14px 12px; text-align: left;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }
+  th {
+    color: var(--gold-soft); font-weight: 500; font-size: 12px;
+    text-transform: uppercase; letter-spacing: 0.8px;
+    background: rgba(15,13,26,0.4);
+  }
+  tr:hover td { background: rgba(212,175,55,0.04); }
+  td strong { color: var(--text); }
+
+  /* STATS GRID */
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 18px; margin-bottom: 28px;
+  }
+  .stat-card {
+    background: var(--surface); backdrop-filter: blur(10px);
+    border: 1px solid var(--border); border-radius: 16px;
+    padding: 24px; position: relative; overflow: hidden;
+  }
+  .stat-card::before {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: linear-gradient(180deg, var(--gold), var(--rose));
+  }
+  .stat-card .number {
+    font-size: 38px; font-weight: 700; color: var(--gold);
+    letter-spacing: -1px; line-height: 1;
+  }
+  .stat-card .label { color: var(--muted); margin-top: 8px; font-size: 13px; }
+  .stat-card .icon {
+    position: absolute; right: 16px; top: 16px; font-size: 22px; opacity: 0.4;
+  }
+
+  /* BADGES */
+  .badge {
+    display: inline-block; padding: 4px 11px; margin: 2px;
+    background: rgba(212,175,55,0.12); color: var(--gold-soft);
+    border: 1px solid var(--border); border-radius: 999px;
+    font-size: 12px;
+  }
+  .badge.rose { background: rgba(232,164,184,0.12); color: var(--rose); border-color: rgba(232,164,184,0.25); }
+  .badge.info { background: rgba(138,180,255,0.12); color: var(--info); border-color: rgba(138,180,255,0.25); }
+  .badge.success { background: rgba(77,212,168,0.14); color: var(--success); border-color: rgba(77,212,168,0.25); }
+  .badge.muted { background: rgba(139,132,153,0.14); color: var(--muted); border-color: rgba(139,132,153,0.2); }
+
+  /* FLASH */
+  .flash {
+    padding: 12px 18px; border-radius: 10px; margin-bottom: 14px;
+    border: 1px solid; font-size: 14px;
+  }
+  .flash.success { background: rgba(77,212,168,0.12); color: var(--success); border-color: rgba(77,212,168,0.3); }
+  .flash.error { background: rgba(255,92,124,0.12); color: var(--danger); border-color: rgba(255,92,124,0.3); }
+
+  /* PROGRESS */
+  .progress-bar {
+    background: rgba(15,13,26,0.6); border-radius: 999px; height: 22px;
+    overflow: hidden; border: 1px solid var(--border);
+  }
+  .progress-fill {
+    height: 100%; background: linear-gradient(90deg, var(--gold), var(--rose));
+    display: flex; align-items: center; justify-content: center;
+    color: #1a1428; font-size: 11px; font-weight: 700;
+    transition: width 0.6s ease;
+  }
+
+  /* GROUPS */
+  .checkbox-group {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 8px;
+  }
+  .checkbox-group label {
+    display: flex; align-items: center; gap: 8px; font-weight: normal;
+    cursor: pointer; padding: 8px 12px; border-radius: 6px;
+    background: rgba(15,13,26,0.4); border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .checkbox-group input { width: auto; }
+
+  .inline-form { display: inline; }
+  .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .row-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 700px) {
+    .row-2, .row-3 { grid-template-columns: 1fr; }
+  }
+
+  /* RATING STARS */
+  .stars { color: var(--gold); letter-spacing: 2px; font-size: 16px; }
+  .stars .empty { color: rgba(212,175,55,0.25); }
+  .rating-input { display: flex; gap: 6px; }
+  .rating-input input { display: none; }
+  .rating-input label {
+    cursor: pointer; font-size: 28px; color: rgba(212,175,55,0.25);
+    transition: color 0.15s; padding: 0; margin: 0;
+  }
+  .rating-input label:hover, .rating-input label:hover ~ label,
+  .rating-input input:checked ~ label { color: var(--gold); }
+  .rating-input { flex-direction: row-reverse; justify-content: flex-end; }
+
+  /* AUTH */
+  .auth-wrap {
+    max-width: 420px; margin: 60px auto; padding: 0 20px;
+  }
+  .auth-card {
+    background: var(--surface); backdrop-filter: blur(14px);
+    border: 1px solid var(--border); border-radius: 18px;
+    padding: 36px;
+  }
+  .auth-card h1 {
+    text-align: center; font-size: 24px; margin-bottom: 6px;
+  }
+  .auth-card .subtitle { text-align: center; }
+  .auth-tabs {
+    display: flex; gap: 4px; padding: 4px;
+    background: rgba(15,13,26,0.5); border-radius: 10px;
+    margin-bottom: 20px;
+  }
+  .auth-tabs a {
+    flex: 1; text-align: center; padding: 10px;
+    color: var(--muted); border-radius: 8px; font-size: 14px;
+  }
+  .auth-tabs a.active { background: rgba(212,175,55,0.15); color: var(--gold); }
+
+  /* CHART */
+  .chart-controls { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .chart-controls button {
+    padding: 8px 14px; background: rgba(15,13,26,0.4);
+    color: var(--muted); border: 1px solid var(--border);
+    border-radius: 8px; cursor: pointer; font-size: 13px;
+    transition: all 0.2s;
+  }
+  .chart-controls button.active {
+    background: rgba(212,175,55,0.15); color: var(--gold); border-color: var(--gold);
+  }
+  .chart-controls button:hover { color: var(--gold-soft); }
+  .chart-box { position: relative; height: 360px; }
+
+  /* APPOINTMENT STATUS */
+  .status-active { color: var(--info); }
+  .status-completed { color: var(--success); }
+  .status-cancelled { color: var(--muted); text-decoration: line-through; }
+
+  /* HERO */
+  .hero {
+    background: linear-gradient(135deg, rgba(212,175,55,0.12), rgba(232,164,184,0.08));
+    border: 1px solid var(--border); border-radius: 20px;
+    padding: 40px; margin-bottom: 28px; position: relative; overflow: hidden;
+  }
+  .hero::after {
+    content: ''; position: absolute; right: -80px; top: -80px;
+    width: 280px; height: 280px; border-radius: 50%;
+    background: radial-gradient(circle, rgba(212,175,55,0.18), transparent 70%);
+  }
+  .hero h1 { font-size: 36px; }
+  .hero p { color: var(--muted); max-width: 620px; }
+</style>
+"""
+
+
+def navbar_html(user):
+    """Динамический навбар по роли."""
+    if not user:
+        links = [
+            ('/', 'Главная'),
+            ('/services-public', 'Услуги'),
+            ('/login', 'Вход'),
+            ('/register', 'Регистрация'),
+        ]
+    elif user.role == 'admin':
+        links = [
+            ('/', 'Панель'),
+            ('/appointments', 'Записи'),
+            ('/appointments/new', '+ Запись'),
+            ('/clients', 'Клиенты'),
+            ('/masters', 'Мастера'),
+            ('/services', 'Услуги'),
+            ('/schedule', 'Расписание'),
+            ('/analytics', 'Аналитика'),
+            ('/genetic', 'GA-оптимизация'),
+        ]
+    elif user.role == 'master':
+        links = [
+            ('/', 'Главная'),
+            ('/cabinet/master', 'Мой кабинет'),
+            ('/cabinet/master/schedule', 'Моё расписание'),
+        ]
+    else:  # client
+        links = [
+            ('/', 'Главная'),
+            ('/services-public', 'Услуги'),
+            ('/cabinet/client', 'Мой кабинет'),
+            ('/cabinet/client/book', 'Записаться'),
+        ]
+
+    items = ''.join(f'<a href="{href}">{label}</a>' for href, label in links)
+
+    if user:
+        role_label = {'admin': 'Админ', 'master': 'Мастер', 'client': 'Клиент'}[user.role]
+        if user.role == 'master' and user.master_profile:
+            who = user.master_profile.full_name
+        elif user.role == 'client' and user.client_profile:
+            who = user.client_profile.full_name
+        else:
+            who = user.username
+        user_block = (
+            f'<div class="nav-user">'
+            f'<span class="who"><strong>{who}</strong> '
+            f'<span class="role-pill {user.role}">{role_label}</span></span>'
+            f'<a href="/logout" class="btn btn-outline btn-sm">Выйти</a>'
+            f'</div>'
+        )
+    else:
+        user_block = ''
+
+    return f"""
+<nav class="navbar">
+  <div class="navbar-content">
+    <a href="/" class="logo"><span class="dot"></span> AURUM · Beauty Studio</a>
+    <div class="nav-links">{items}{user_block}<button type="button" class="theme-toggle" id="themeToggle" title="Сменить тему" aria-label="Сменить тему">🌙</button></div>
+  </div>
+</nav>
+"""
+
+
+FLASH_BLOCK = """
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+    <div class="flash {{ category }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+"""
+
+
+def page(title, content):
+    user = current_user()
+    nav = navbar_html(user)
+    return f"""<!DOCTYPE html><html lang="ru" data-theme="dark"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title} · AURUM</title>{BASE_CSS}
+<script>
+  // Применяем сохранённую тему сразу, до отрисовки страницы (без мигания)
+  (function() {{
+    try {{
+      var saved = localStorage.getItem('aurum-theme') || 'dark';
+      document.documentElement.setAttribute('data-theme', saved);
+    }} catch (e) {{}}
+  }})();
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head><body>{nav}
+<div class="container">{FLASH_BLOCK}{content}</div>
+<script>
+  // Переключение светлой и тёмной темы с запоминанием выбора
+  (function() {{
+    var root = document.documentElement;
+    var btn = document.getElementById('themeToggle');
+    function syncIcon() {{
+      if (!btn) return;
+      btn.textContent = root.getAttribute('data-theme') === 'light' ? '☀️' : '🌙';
+    }}
+    syncIcon();
+    if (btn) {{
+      btn.addEventListener('click', function() {{
+        var next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+        root.setAttribute('data-theme', next);
+        try {{ localStorage.setItem('aurum-theme', next); }} catch (e) {{}}
+        syncIcon();
+      }});
+    }}
+  }})();
+</script>
+</body></html>"""
+
+
+def stars_html(rating, max_stars=5):
+    """HTML-звёздочки для рейтинга. rating может быть float."""
+    full = int(rating)
+    has_half = (rating - full) >= 0.5
+    html = '<span class="stars">'
+    for i in range(max_stars):
+        if i < full:
+            html += '★'
+        elif i == full and has_half:
+            html += '★'
+        else:
+            html += '<span class="empty">★</span>'
+    html += '</span>'
+    return html
+
+
+app.jinja_env.globals['stars_html'] = stars_html
+
+
+# ============ МАРШРУТЫ: АУТЕНТИФИКАЦИЯ ============
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        user = User.query.filter_by(username=username).first()
+        if user and user.check_password(password):
+            session['user_id'] = user.id
+            flash('Добро пожаловать!', 'success')
+            if user.role == 'admin':
+                return redirect(url_for('index'))
+            elif user.role == 'master':
+                return redirect(url_for('master_cabinet'))
+            else:
+                return redirect(url_for('client_cabinet'))
+        flash('Неверный логин или пароль', 'error')
+
+    content = """
+<div class="auth-wrap">
+  <div class="auth-card">
+    <h1>Вход в систему</h1>
+    <p class="subtitle">Введите данные аккаунта</p>
+    <div class="auth-tabs">
+      <a href="/login" class="active">Вход</a>
+      <a href="/register">Регистрация</a>
+    </div>
+    <form method="POST">
+      <div class="form-group"><label>Логин</label><input type="text" name="username" required autofocus></div>
+      <div class="form-group"><label>Пароль</label><input type="password" name="password" required></div>
+      <button type="submit" class="btn" style="width:100%;">Войти</button>
+    </form>
+    <div style="margin-top:20px; padding: 14px; background: rgba(15,13,26,0.4); border-radius: 8px; font-size: 12px; color: var(--muted);">
+      <strong style="color: var(--gold-soft);">Демо-аккаунты:</strong><br>
+      Админ — <code>admin</code> / <code>admin</code><br>
+      Мастер — <code>anna</code> / <code>master</code><br>
+      Клиент — <code>client</code> / <code>client</code>
+    </div>
+  </div>
+</div>
+"""
+    return render_template_string(page('Вход', content))
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        role = request.form.get('role', 'client')  # только клиент через регистрацию
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        first_name = request.form.get('first_name', '').strip()
+        last_name = request.form.get('last_name', '').strip()
+        phone = request.form.get('phone', '').strip()
+        email = request.form.get('email', '').strip()
+
+        if not all([username, password, first_name, last_name]):
+            flash('Заполните обязательные поля', 'error')
+            return redirect(url_for('register'))
+        if User.query.filter_by(username=username).first():
+            flash('Логин уже занят', 'error')
+            return redirect(url_for('register'))
+        if len(password) < 4:
+            flash('Пароль должен быть не менее 4 символов', 'error')
+            return redirect(url_for('register'))
+
+        client = Client(first_name=first_name, last_name=last_name,
+                        phone=phone, email=email)
+        db.session.add(client)
+        db.session.flush()
+
+        user = User(username=username, role='client', client_id=client.id)
+        user.set_password(password)
+        db.session.add(user)
+        db.session.commit()
+
+        session['user_id'] = user.id
+        flash(f'Добро пожаловать, {first_name}!', 'success')
+        return redirect(url_for('client_cabinet'))
+
+    content = """
+<div class="auth-wrap">
+  <div class="auth-card">
+    <h1>Регистрация клиента</h1>
+    <p class="subtitle">Создайте аккаунт для онлайн-записи</p>
+    <div class="auth-tabs">
+      <a href="/login">Вход</a>
+      <a href="/register" class="active">Регистрация</a>
+    </div>
+    <form method="POST">
+      <div class="row-2">
+        <div class="form-group"><label>Имя *</label><input type="text" name="first_name" required></div>
+        <div class="form-group"><label>Фамилия *</label><input type="text" name="last_name" required></div>
+      </div>
+      <div class="row-2">
+        <div class="form-group"><label>Телефон</label><input type="text" name="phone" placeholder="+7..."></div>
+        <div class="form-group"><label>Email</label><input type="email" name="email"></div>
+      </div>
+      <div class="form-group"><label>Логин *</label><input type="text" name="username" required></div>
+      <div class="form-group"><label>Пароль *</label><input type="password" name="password" required minlength="4"></div>
+      <button type="submit" class="btn" style="width:100%;">Создать аккаунт</button>
+    </form>
+  </div>
+</div>
+"""
+    return render_template_string(page('Регистрация', content))
+
+
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    flash('Вы вышли из системы', 'success')
+    return redirect(url_for('login'))
+
+
+# ============ ГЛАВНАЯ ============
+
+@app.route('/')
+def index():
+    user = current_user()
+    if user and user.role == 'master':
+        return redirect(url_for('master_cabinet'))
+    if user and user.role == 'client':
+        return redirect(url_for('client_cabinet'))
+
+    # для админа — дашборд, для гостя — лендинг
+    today = date.today()
+    today_start = datetime.combine(today, time.min)
+    today_end = datetime.combine(today, time.max)
+
+    if user and user.role == 'admin':
+        today_count = Appointment.query.filter(
+            Appointment.start_time >= today_start,
+            Appointment.start_time <= today_end,
+            Appointment.status == 'active'
+        ).count()
+        masters_count = Master.query.count()
+        services_count = Service.query.count()
+        clients_count = Client.query.count()
+        total_revenue = db.session.query(func.sum(Service.price)).join(Appointment).filter(
+            Appointment.status.in_(['active', 'completed'])
+        ).scalar() or 0
+
+        content = """
+<div class="hero">
+  <h1>Панель администратора <span class="accent">·</span> AURUM</h1>
+  <p>Контроль записей, мастеров, расписания и аналитики салона. Управляйте загрузкой
+     с помощью алгоритма автоподбора и оптимизируйте дневной график генетическим алгоритмом.</p>
+</div>
+<div class="stats-grid">
+  <div class="stat-card"><div class="icon">📅</div><div class="number">{{ today_count }}</div><div class="label">Записей сегодня</div></div>
+  <div class="stat-card"><div class="icon">💇</div><div class="number">{{ masters_count }}</div><div class="label">Мастеров</div></div>
+  <div class="stat-card"><div class="icon">✨</div><div class="number">{{ services_count }}</div><div class="label">Услуг в каталоге</div></div>
+  <div class="stat-card"><div class="icon">👥</div><div class="number">{{ clients_count }}</div><div class="label">Клиентов</div></div>
+</div>
+<div class="card">
+  <h2>Быстрые действия</h2>
+  <a href="/appointments/new" class="btn">+ Создать запись</a>
+  <a href="/clients" class="btn btn-outline">Поиск клиента</a>
+  <a href="/analytics" class="btn btn-outline">Аналитика</a>
+  <a href="/genetic" class="btn btn-outline">Генетическая оптимизация</a>
+</div>
+<div class="card">
+  <h2>О системе</h2>
+  <p style="color: var(--muted);">Жадный алгоритм автоподбора учитывает рейтинг мастера и равномерность загрузки.
+     Генетический алгоритм решает задачу оптимального распределения большого пула заявок на день
+     (планировщик максимизирует качество назначений и минимизирует конфликты времени).
+     Поддерживается экспорт записей и аналитики в Excel.</p>
+</div>
+"""
+        return render_template_string(page('Панель', content),
+                                      today_count=today_count, masters_count=masters_count,
+                                      services_count=services_count, clients_count=clients_count)
+    # лендинг для незалогиненных
+    masters = Master.query.limit(4).all()
+    services = Service.query.limit(6).all()
+    content = """
+<div class="hero">
+  <h1>AURUM · <span class="accent">Beauty Studio</span></h1>
+  <p>Премиальный салон красоты. Стрижки, окрашивание, маникюр, педикюр, укладки.
+     Запишитесь онлайн к лучшим мастерам — система подберёт самого рейтингового свободного специалиста.</p>
+  <div style="margin-top: 20px;">
+    <a href="/register" class="btn">Записаться онлайн</a>
+    <a href="/login" class="btn btn-outline">Войти</a>
+  </div>
+</div>
+<div class="card">
+  <h2>Наши услуги</h2>
+  <div class="stats-grid">
+  {% for s in services %}
+    <div class="stat-card">
+      <div class="number" style="font-size: 22px;">{{ s.name }}</div>
+      <div class="label">{{ s.duration }} мин · <span style="color: var(--gold);">{{ s.price }} ₽</span></div>
+    </div>
+  {% endfor %}
+  </div>
+</div>
+<div class="card">
+  <h2>Наши мастера</h2>
+  {% if masters %}
+  <div class="stats-grid">
+  {% for m in masters %}
+    <div class="stat-card">
+      <div class="number" style="font-size: 18px;">{{ m.full_name }}</div>
+      <div class="label">{{ stars_html(m.rating) | safe }} · {{ m.rating }}</div>
+    </div>
+  {% endfor %}
+  </div>
+  {% else %}<p style="color:var(--muted);">Каталог мастеров скоро появится.</p>{% endif %}
+</div>
+"""
+    return render_template_string(page('AURUM Beauty', content),
+                                  masters=masters, services=services)
+
+
+@app.route('/services-public')
+def services_public():
+    """Публичный каталог услуг."""
+    all_services = Service.query.all()
+    content = """
+<h1>Каталог услуг</h1>
+<p class="subtitle">Все услуги салона AURUM</p>
+<div class="card">
+  <table>
+    <thead><tr><th>Услуга</th><th>Длительность</th><th>Стоимость</th><th>Мастера</th></tr></thead>
+    <tbody>
+    {% for s in services %}
+      <tr>
+        <td><strong>{{ s.name }}</strong></td>
+        <td>{{ s.duration }} мин</td>
+        <td><strong style="color: var(--gold);">{{ s.price }} ₽</strong></td>
+        <td>{% for m in s.masters %}<span class="badge">{{ m.full_name }}</span>{% else %}<em style="color:var(--muted);">—</em>{% endfor %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+"""
+    return render_template_string(page('Услуги', content), services=all_services)
+
+
+# ============ МАРШРУТЫ: МАСТЕРА (админ) ============
+
+@app.route('/masters')
+@login_required(role='admin')
+def masters():
+    all_masters = Master.query.all()
+    all_services = Service.query.all()
+    content = """
+<h1>Мастера</h1>
+<p class="subtitle">Сотрудники салона, рейтинги и услуги</p>
+<div class="card">
+  <h2>Добавить мастера</h2>
+  <form method="POST" action="/masters/add">
+    <div class="row-2">
+      <div class="form-group"><label>Имя *</label><input type="text" name="first_name" required></div>
+      <div class="form-group"><label>Фамилия *</label><input type="text" name="last_name" required></div>
+    </div>
+    <div class="row-2">
+      <div class="form-group"><label>Телефон</label><input type="text" name="phone" placeholder="+7..."></div>
+      <div class="form-group"><label>Email</label><input type="email" name="email"></div>
+    </div>
+    <div class="row-2">
+      <div class="form-group"><label>Логин для входа</label><input type="text" name="username" placeholder="латиницей"></div>
+      <div class="form-group"><label>Пароль</label><input type="text" name="password" placeholder="мин. 4 символа"></div>
+    </div>
+    <div class="row-2">
+      <div class="form-group"><label>Начало рабочего дня</label><input type="time" name="work_start" value="09:00"></div>
+      <div class="form-group"><label>Конец рабочего дня</label><input type="time" name="work_end" value="20:00"></div>
+    </div>
+    <div class="form-group"><label>Услуги</label>
+      <div class="checkbox-group">
+      {% for s in services %}
+        <label><input type="checkbox" name="services" value="{{ s.id }}"> {{ s.name }}</label>
+      {% endfor %}
+      </div>
+    </div>
+    <button type="submit" class="btn">Добавить мастера</button>
+  </form>
+</div>
+<div class="card">
+  <h2>Список мастеров</h2>
+  {% if masters %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>ФИО</th><th>Контакты</th><th>Услуги</th><th>График</th><th>Рейтинг</th><th>Действия</th></tr></thead>
+    <tbody>
+    {% for m in masters %}
+      <tr>
+        <td><strong>{{ m.full_name }}</strong>{% if m.user %}<br><span class="badge muted">{{ m.user.username }}</span>{% endif %}</td>
+        <td>{{ m.phone or '—' }}<br><small style="color:var(--muted);">{{ m.email or '' }}</small></td>
+        <td>{% for s in m.services %}<span class="badge">{{ s.name }}</span>{% endfor %}</td>
+        <td>{{ m.work_start.strftime('%H:%M') }} – {{ m.work_end.strftime('%H:%M') }}</td>
+        <td>{{ stars_html(m.rating) | safe }}<br><small style="color:var(--muted);">{{ m.rating }} ({{ m.reviews_count }} отз.)</small></td>
+        <td>
+          <form method="POST" action="/masters/delete/{{ m.id }}" class="inline-form"
+                onsubmit="return confirm('Удалить мастера?')">
+            <button type="submit" class="btn btn-danger btn-sm">Удалить</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p style="color:var(--muted);">Мастера не добавлены</p>{% endif %}
+</div>
+"""
+    return render_template_string(page('Мастера', content),
+                                  masters=all_masters, services=all_services)
+
+
+@app.route('/masters/add', methods=['POST'])
+@login_required(role='admin')
+def add_master():
+    first_name = request.form.get('first_name', '').strip()
+    last_name = request.form.get('last_name', '').strip()
+    phone = request.form.get('phone', '').strip()
+    email = request.form.get('email', '').strip()
+    username = request.form.get('username', '').strip()
+    password = request.form.get('password', '').strip()
+    work_start = request.form.get('work_start') or '09:00'
+    work_end = request.form.get('work_end') or '20:00'
+    service_ids = request.form.getlist('services')
+
+    if not first_name or not last_name:
+        flash('Введите имя и фамилию мастера', 'error')
+        return redirect(url_for('masters'))
+    try:
+        ws = datetime.strptime(work_start, '%H:%M').time()
+        we = datetime.strptime(work_end, '%H:%M').time()
+    except ValueError:
+        flash('Некорректное время работы', 'error')
+        return redirect(url_for('masters'))
+
+    master = Master(first_name=first_name, last_name=last_name, phone=phone,
+                    email=email, work_start=ws, work_end=we)
+    if service_ids:
+        master.services = Service.query.filter(Service.id.in_(service_ids)).all()
+    db.session.add(master)
+    db.session.flush()
+
+    if username and password and len(password) >= 4:
+        if User.query.filter_by(username=username).first():
+            flash(f'Логин "{username}" занят, мастер добавлен без аккаунта', 'error')
+        else:
+            u = User(username=username, role='master', master_id=master.id)
+            u.set_password(password)
+            db.session.add(u)
+
+    db.session.commit()
+    flash(f'Мастер {last_name} {first_name} добавлен', 'success')
+    return redirect(url_for('masters'))
+
+
+@app.route('/masters/delete/<int:master_id>', methods=['POST'])
+@login_required(role='admin')
+def delete_master(master_id):
+    master = Master.query.get_or_404(master_id)
+    # удаляем связанного пользователя
+    if master.user:
+        db.session.delete(master.user)
+    Appointment.query.filter_by(master_id=master_id).delete()
+    Schedule.query.filter_by(master_id=master_id).delete()
+    db.session.delete(master)
+    db.session.commit()
+    flash('Мастер удалён', 'success')
+    return redirect(url_for('masters'))
+
+
+# ============ МАРШРУТЫ: УСЛУГИ ============
+
+@app.route('/services')
+@login_required(role='admin')
+def services():
+    all_services = Service.query.all()
+    content = """
+<h1>Услуги</h1>
+<p class="subtitle">Каталог услуг салона</p>
+<div class="card">
+  <h2>Добавить услугу</h2>
+  <form method="POST" action="/services/add">
+    <div class="form-group"><label>Название</label><input type="text" name="name" required></div>
+    <div class="row-2">
+      <div class="form-group"><label>Длительность (мин)</label><input type="number" name="duration" min="5" step="5" required></div>
+      <div class="form-group"><label>Цена (₽)</label><input type="number" name="price" min="0" step="50" required></div>
+    </div>
+    <button type="submit" class="btn">Добавить</button>
+  </form>
+</div>
+<div class="card">
+  <h2>Список услуг</h2>
+  {% if services %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Название</th><th>Длительность</th><th>Цена</th><th>Мастера</th><th></th></tr></thead>
+    <tbody>
+    {% for s in services %}
+      <tr>
+        <td><strong>{{ s.name }}</strong></td>
+        <td>{{ s.duration }} мин</td>
+        <td><strong style="color:var(--gold);">{{ s.price }} ₽</strong></td>
+        <td>{% for m in s.masters %}<span class="badge">{{ m.full_name }}</span>{% else %}<em style="color:var(--muted);">нет мастеров</em>{% endfor %}</td>
+        <td>
+          <form method="POST" action="/services/delete/{{ s.id }}" class="inline-form"
+                onsubmit="return confirm('Удалить услугу?')">
+            <button type="submit" class="btn btn-danger btn-sm">Удалить</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p style="color:var(--muted);">Услуги не добавлены</p>{% endif %}
+</div>
+"""
+    return render_template_string(page('Услуги', content), services=all_services)
+
+
+@app.route('/services/add', methods=['POST'])
+@login_required(role='admin')
+def add_service():
+    name = request.form.get('name', '').strip()
+    duration = request.form.get('duration')
+    price = request.form.get('price')
+    if not name or not duration or not price:
+        flash('Заполните все поля', 'error')
+        return redirect(url_for('services'))
+    try:
+        s = Service(name=name, duration=int(duration), price=float(price))
+        db.session.add(s)
+        db.session.commit()
+        flash(f'Услуга "{name}" добавлена', 'success')
+    except ValueError:
+        flash('Некорректные числовые значения', 'error')
+    return redirect(url_for('services'))
+
+
+@app.route('/services/delete/<int:service_id>', methods=['POST'])
+@login_required(role='admin')
+def delete_service(service_id):
+    s = Service.query.get_or_404(service_id)
+    Appointment.query.filter_by(service_id=service_id).delete()
+    db.session.delete(s)
+    db.session.commit()
+    flash('Услуга удалена', 'success')
+    return redirect(url_for('services'))
+
+
+# ============ МАРШРУТЫ: КЛИЕНТЫ И ПОИСК ============
+
+@app.route('/clients')
+@login_required(role='admin')
+def clients():
+    q = request.args.get('q', '').strip()
+    query = Client.query
+    if q:
+        like = f'%{q}%'
+        query = query.filter(or_(
+            Client.first_name.ilike(like),
+            Client.last_name.ilike(like),
+            Client.phone.ilike(like),
+            (Client.last_name + ' ' + Client.first_name).ilike(like),
+        ))
+    found = query.order_by(Client.last_name).all()
+
+    content = """
+<h1>Клиенты</h1>
+<p class="subtitle">Поиск по ФИО или номеру телефона</p>
+<div class="card">
+  <form method="GET" style="display:flex; gap: 10px; align-items:end; flex-wrap:wrap;">
+    <div class="form-group" style="flex:1; min-width:240px; margin-bottom:0;">
+      <label>Поиск</label>
+      <input type="text" name="q" value="{{ q }}" placeholder="Иванова, +79001234567, Анна">
+    </div>
+    <button type="submit" class="btn">Найти</button>
+    <a href="/clients" class="btn btn-grey">Сбросить</a>
+    <a href="/clients/add" class="btn btn-outline">+ Новый клиент</a>
+  </form>
+</div>
+<div class="card">
+  <h2>Результаты ({{ clients|length }})</h2>
+  {% if clients %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>ФИО</th><th>Телефон</th><th>Email</th><th>Записей</th><th>Действия</th></tr></thead>
+    <tbody>
+    {% for c in clients %}
+      <tr>
+        <td><strong>{{ c.full_name }}</strong></td>
+        <td>{{ c.phone or '—' }}</td>
+        <td>{{ c.email or '—' }}</td>
+        <td>{{ c.appointments|length }}</td>
+        <td><a href="/clients/{{ c.id }}" class="btn btn-outline btn-sm">Профиль</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p style="color:var(--muted);">{% if q %}Ничего не найдено{% else %}Клиентов пока нет{% endif %}</p>{% endif %}
+</div>
+"""
+    return render_template_string(page('Клиенты', content), clients=found, q=q)
+
+
+@app.route('/clients/add', methods=['GET', 'POST'])
+@login_required(role='admin')
+def add_client():
+    if request.method == 'POST':
+        first_name = request.form.get('first_name', '').strip()
+        last_name = request.form.get('last_name', '').strip()
+        phone = request.form.get('phone', '').strip()
+        email = request.form.get('email', '').strip()
+        if not first_name or not last_name:
+            flash('Введите имя и фамилию', 'error')
+            return redirect(url_for('add_client'))
+        c = Client(first_name=first_name, last_name=last_name, phone=phone, email=email)
+        db.session.add(c)
+        db.session.commit()
+        flash(f'Клиент {last_name} {first_name} добавлен', 'success')
+        return redirect(url_for('clients'))
+
+    content = """
+<h1>Новый клиент</h1>
+<div class="card">
+  <form method="POST">
+    <div class="row-2">
+      <div class="form-group"><label>Имя *</label><input type="text" name="first_name" required></div>
+      <div class="form-group"><label>Фамилия *</label><input type="text" name="last_name" required></div>
+    </div>
+    <div class="row-2">
+      <div class="form-group"><label>Телефон</label><input type="text" name="phone" placeholder="+7..."></div>
+      <div class="form-group"><label>Email</label><input type="email" name="email"></div>
+    </div>
+    <button type="submit" class="btn">Сохранить</button>
+    <a href="/clients" class="btn btn-grey">Отмена</a>
+  </form>
+</div>
+"""
+    return render_template_string(page('Новый клиент', content))
+
+
+@app.route('/clients/<int:client_id>')
+@login_required(role='admin')
+def client_profile(client_id):
+    c = Client.query.get_or_404(client_id)
+    apps = Appointment.query.filter_by(client_id=client_id).order_by(Appointment.start_time.desc()).all()
+    content = """
+<h1>{{ c.full_name }}</h1>
+<p class="subtitle">{{ c.phone or 'без телефона' }} · {{ c.email or 'без email' }}</p>
+<div class="card">
+  <h2>История записей ({{ apps|length }})</h2>
+  {% if apps %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Дата</th><th>Услуга</th><th>Мастер</th><th>Стоимость</th><th>Статус</th><th>Оценка</th></tr></thead>
+    <tbody>
+    {% for a in apps %}
+      <tr>
+        <td>{{ a.start_time.strftime('%d.%m.%Y %H:%M') }}</td>
+        <td>{{ a.service.name }}</td>
+        <td>{{ a.master.full_name }}</td>
+        <td>{{ a.service.price }} ₽</td>
+        <td><span class="status-{{ a.status }}">{{ {'active':'активна','completed':'выполнена','cancelled':'отменена'}[a.status] }}</span></td>
+        <td>{% if a.review %}{{ stars_html(a.review.rating) | safe }}{% else %}—{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p style="color:var(--muted);">Записей пока нет</p>{% endif %}
+</div>
+<a href="/clients" class="btn btn-grey">← Назад к списку</a>
+"""
+    return render_template_string(page(c.full_name, content), c=c, apps=apps)
+
+
+# ============ МАРШРУТЫ: ЗАПИСИ ============
+
+@app.route('/appointments')
+@login_required(role='admin')
+def appointments():
+    filter_date = request.args.get('date', '')
+    filter_status = request.args.get('status', 'all')
+    query = Appointment.query
+
+    if filter_status != 'all':
+        query = query.filter(Appointment.status == filter_status)
+
+    if filter_date:
+        try:
+            d = datetime.strptime(filter_date, '%Y-%m-%d').date()
+            day_start = datetime.combine(d, time.min)
+            day_end = datetime.combine(d, time.max)
+            query = query.filter(Appointment.start_time >= day_start,
+                                 Appointment.start_time <= day_end)
+        except ValueError:
+            pass
+    all_app = query.order_by(Appointment.start_time.desc()).all()
+
+    content = """
+<h1>Записи</h1>
+<p class="subtitle">Все записи салона</p>
+<div class="card">
+  <form method="GET" style="display:flex; gap:10px; align-items:end; flex-wrap:wrap;">
+    <div class="form-group" style="margin-bottom:0; flex:1; min-width:200px;">
+      <label>Фильтр по дате</label>
+      <input type="date" name="date" value="{{ filter_date }}">
+    </div>
+    <div class="form-group" style="margin-bottom:0; min-width:180px;">
+      <label>Статус</label>
+      <select name="status">
+        <option value="all" {% if filter_status=='all' %}selected{% endif %}>Все</option>
+        <option value="active" {% if filter_status=='active' %}selected{% endif %}>Активные</option>
+        <option value="completed" {% if filter_status=='completed' %}selected{% endif %}>Выполненные</option>
+        <option value="cancelled" {% if filter_status=='cancelled' %}selected{% endif %}>Отменённые</option>
+      </select>
+    </div>
+    <button type="submit" class="btn">Применить</button>
+    <a href="/appointments" class="btn btn-grey">Сбросить</a>
+    <a href="/appointments/new" class="btn btn-outline">+ Новая</a>
+    <a href="/export/appointments?date={{ filter_date }}&status={{ filter_status }}" class="btn btn-outline">⬇ Excel</a>
+  </form>
+</div>
+<div class="card">
+  <h2>Найдено: {{ appointments|length }}</h2>
+  {% if appointments %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Дата и время</th><th>Клиент</th><th>Телефон</th><th>Услуга</th><th>Мастер</th><th>Стоимость</th><th>Статус</th><th>Действия</th></tr></thead>
+    <tbody>
+    {% for a in appointments %}
+      <tr>
+        <td><strong>{{ a.start_time.strftime('%d.%m.%Y') }}</strong><br><span style="color:var(--muted);">{{ a.start_time.strftime('%H:%M') }} – {{ a.end_time.strftime('%H:%M') }}</span></td>
+        <td>{{ a.client.full_name }}</td>
+        <td>{{ a.client.phone or '—' }}</td>
+        <td>{{ a.service.name }}</td>
+        <td>{{ a.master.full_name }}</td>
+        <td><strong style="color:var(--gold);">{{ a.service.price }} ₽</strong></td>
+        <td><span class="status-{{ a.status }}">{{ {'active':'активна','completed':'выполнена','cancelled':'отменена'}[a.status] }}</span></td>
+        <td>
+          {% if a.status == 'active' %}
+          <form method="POST" action="/appointments/complete/{{ a.id }}" class="inline-form">
+            <button type="submit" class="btn btn-success btn-sm">✓</button>
+          </form>
+          <form method="POST" action="/appointments/cancel/{{ a.id }}" class="inline-form"
+                onsubmit="return confirm('Отменить запись?')">
+            <button type="submit" class="btn btn-danger btn-sm">✕</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p style="color:var(--muted);">Записей не найдено</p>{% endif %}
+</div>
+"""
+    return render_template_string(page('Записи', content),
+                                  appointments=all_app, filter_date=filter_date,
+                                  filter_status=filter_status)
+
+
+@app.route('/appointments/new', methods=['GET', 'POST'])
+@login_required(role='admin')
+def new_appointment():
+    if request.method == 'POST':
+        client_id = request.form.get('client_id')
+        new_first = request.form.get('new_first_name', '').strip()
+        new_last = request.form.get('new_last_name', '').strip()
+        new_phone = request.form.get('new_phone', '').strip()
+        service_id = request.form.get('service_id')
+        master_id = request.form.get('master_id')
+        date_str = request.form.get('date')
+        time_str = request.form.get('time')
+
+        if not all([service_id, date_str, time_str]):
+            flash('Заполните обязательные поля', 'error')
+            return redirect(url_for('new_appointment'))
+        try:
+            start_time = datetime.strptime(f'{date_str} {time_str}', '%Y-%m-%d %H:%M')
+        except ValueError:
+            flash('Некорректная дата/время', 'error')
+            return redirect(url_for('new_appointment'))
+
+        service = Service.query.get(service_id)
+        if not service:
+            flash('Услуга не найдена', 'error')
+            return redirect(url_for('new_appointment'))
+        end_time = start_time + timedelta(minutes=service.duration)
+
+        # клиент: либо выбран существующий, либо создать нового
+        if client_id and client_id != 'new':
+            client = Client.query.get(client_id)
+            if not client:
+                flash('Клиент не найден', 'error')
+                return redirect(url_for('new_appointment'))
+        else:
+            if not new_first or not new_last:
+                flash('Укажите имя и фамилию нового клиента', 'error')
+                return redirect(url_for('new_appointment'))
+            client = Client(first_name=new_first, last_name=new_last, phone=new_phone)
+            db.session.add(client)
+            db.session.flush()
+
+        # мастер: автоподбор или явный
+        if master_id and master_id != 'auto':
+            master = Master.query.get(master_id)
+            if not master:
+                flash('Мастер не найден', 'error')
+                return redirect(url_for('new_appointment'))
+            if service not in master.services:
+                flash(f'Мастер {master.full_name} не оказывает эту услугу', 'error')
+                return redirect(url_for('new_appointment'))
+            if not is_master_available(master.id, start_time, end_time):
+                flash(f'Мастер {master.full_name} недоступен в это время', 'error')
+                return redirect(url_for('new_appointment'))
+        else:
+            master = find_optimal_master(int(service_id), start_time, end_time)
+            if not master:
+                flash('Нет свободных мастеров для этой услуги', 'error')
+                return redirect(url_for('new_appointment'))
+
+        a = Appointment(client_id=client.id, master_id=master.id, service_id=service.id,
+                        start_time=start_time, end_time=end_time)
+        db.session.add(a)
+        db.session.commit()
+        flash(f'Запись создана. Мастер: {master.full_name} (рейтинг {master.rating})', 'success')
+        return redirect(url_for('appointments'))
+
+    all_services = Service.query.all()
+    all_masters = Master.query.all()
+    all_clients = Client.query.order_by(Client.last_name).all()
+    content = """
+<h1>Новая запись</h1>
+<div class="card">
+  <form method="POST">
+    <div class="form-group"><label>Клиент</label>
+      <select name="client_id" id="client_select" onchange="toggleNew()">
+        <option value="new">+ Новый клиент</option>
+        {% for c in clients %}<option value="{{ c.id }}">{{ c.full_name }} {% if c.phone %}({{ c.phone }}){% endif %}</option>{% endfor %}
+      </select>
+    </div>
+    <div id="new_client_block">
+      <div class="row-2">
+        <div class="form-group"><label>Имя нового клиента</label><input type="text" name="new_first_name"></div>
+        <div class="form-group"><label>Фамилия</label><input type="text" name="new_last_name"></div>
+      </div>
+      <div class="form-group"><label>Телефон</label><input type="text" name="new_phone" placeholder="+7..."></div>
+    </div>
+    <div class="form-group"><label>Услуга *</label>
+      <select name="service_id" required>
+        <option value="">— выберите услугу —</option>
+        {% for s in services %}<option value="{{ s.id }}">{{ s.name }} ({{ s.duration }} мин, {{ s.price }} ₽)</option>{% endfor %}
+      </select>
+    </div>
+    <div class="form-group"><label>Мастер</label>
+      <select name="master_id">
+        <option value="auto">⭐ Автоподбор (рейтинг + загрузка)</option>
+        {% for m in masters %}<option value="{{ m.id }}">{{ m.full_name }} — рейтинг {{ m.rating }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="row-2">
+      <div class="form-group"><label>Дата *</label><input type="date" name="date" required></div>
+      <div class="form-group"><label>Время *</label><input type="time" name="time" required></div>
+    </div>
+    <button type="submit" class="btn">Создать запись</button>
+    <a href="/appointments" class="btn btn-grey">Отмена</a>
+  </form>
+</div>
+<div class="card">
+  <h2>Как работает автоподбор</h2>
+  <p style="color:var(--muted);">Алгоритм отбирает мастеров, которые умеют выполнять выбранную услугу,
+     отсеивает занятых, тех, чьи рабочие часы не подходят, или находящихся в отпуске. Из оставшихся выбирается
+     мастер с лучшим score = 0.7·(рейтинг/5) − 0.3·(нагрузка/макс_нагрузка). Так система отдаёт
+     предпочтение более рейтинговым мастерам, не перегружая одного и того же.</p>
+</div>
+<script>
+function toggleNew() {
+  var sel = document.getElementById('client_select');
+  var block = document.getElementById('new_client_block');
+  block.style.display = (sel.value === 'new') ? 'block' : 'none';
+}
+toggleNew();
+</script>
+"""
+    return render_template_string(page('Новая запись', content),
+                                  services=all_services, masters=all_masters,
+                                  clients=all_clients)
+
+
+@app.route('/appointments/cancel/<int:app_id>', methods=['POST'])
+@login_required()
+def cancel_appointment(app_id):
+    a = Appointment.query.get_or_404(app_id)
+    user = current_user()
+    # клиент может отменять только свои записи
+    if user.role == 'client' and a.client_id != user.client_id:
+        flash('Нет доступа', 'error')
+        return redirect(url_for('client_cabinet'))
+    a.status = 'cancelled'
+    db.session.commit()
+    flash('Запись отменена', 'success')
+    if user.role == 'client':
+        return redirect(url_for('client_cabinet'))
+    return redirect(url_for('appointments'))
+
+
+@app.route('/appointments/complete/<int:app_id>', methods=['POST'])
+@login_required(role=['admin', 'master'])
+def complete_appointment(app_id):
+    a = Appointment.query.get_or_404(app_id)
+    user = current_user()
+    if user.role == 'master' and a.master_id != user.master_id:
+        flash('Нет доступа', 'error')
+        return redirect(url_for('master_cabinet'))
+    a.status = 'completed'
+    db.session.commit()
+    flash('Запись отмечена как выполненная', 'success')
+    if user.role == 'master':
+        return redirect(url_for('master_cabinet'))
+    return redirect(url_for('appointments'))
+
+
+# ============ ЛИЧНЫЙ КАБИНЕТ МАСТЕРА ============
+
+@app.route('/cabinet/master')
+@login_required(role='master')
+def master_cabinet():
+    user = current_user()
+    master = user.master_profile
+    if not master:
+        flash('Профиль мастера не найден', 'error')
+        return redirect(url_for('logout'))
+
+    today = date.today()
+    upcoming = Appointment.query.filter(
+        Appointment.master_id == master.id,
+        Appointment.status == 'active',
+        Appointment.start_time >= datetime.combine(today, time.min)
+    ).order_by(Appointment.start_time).all()
+
+    completed = Appointment.query.filter(
+        Appointment.master_id == master.id,
+        Appointment.status == 'completed'
+    ).order_by(Appointment.start_time.desc()).limit(20).all()
+
+    reviews = Review.query.join(Appointment).filter(
+        Appointment.master_id == master.id
+    ).order_by(Review.created_at.desc()).limit(10).all()
+
+    # счётчики
+    total_completed = Appointment.query.filter_by(master_id=master.id, status='completed').count()
+    month_start = datetime.combine(today.replace(day=1), time.min)
+    month_revenue = db.session.query(func.sum(Service.price)).join(Appointment).filter(
+        Appointment.master_id == master.id,
+        Appointment.status.in_(['active', 'completed']),
+        Appointment.start_time >= month_start
+    ).scalar() or 0
+
+    content = """
+<div class="hero">
+  <h1>Здравствуйте, <span class="accent">{{ master.first_name }}</span>!</h1>
+  <p>Ваш личный кабинет. Здесь вы видите свой график, записи клиентов, отзывы и средний рейтинг.</p>
+</div>
+<div class="stats-grid">
+  <div class="stat-card"><div class="icon">⭐</div><div class="number">{{ master.rating }}</div><div class="label">Средний рейтинг ({{ master.reviews_count }} отз.)</div></div>
+  <div class="stat-card"><div class="icon">📅</div><div class="number">{{ upcoming|length }}</div><div class="label">Предстоящих записей</div></div>
+  <div class="stat-card"><div class="icon">✓</div><div class="number">{{ total_completed }}</div><div class="label">Всего выполнено</div></div>
+  <div class="stat-card"><div class="icon">💰</div><div class="number">{{ month_revenue|round|int }} ₽</div><div class="label">Выручка за месяц</div></div>
+</div>
+
+<div class="card">
+  <h2>Мой рейтинг</h2>
+  <div style="font-size: 32px;">{{ stars_html(master.rating) | safe }} <span style="color:var(--gold); font-weight: 700;">{{ master.rating }}/5.0</span></div>
+  <p style="color:var(--muted); margin-top: 8px;">Основан на {{ master.reviews_count }} отзывах клиентов</p>
+</div>
+
+<div class="card">
+  <h2>Предстоящие записи</h2>
+  {% if upcoming %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Дата и время</th><th>Клиент</th><th>Телефон</th><th>Услуга</th><th>Действия</th></tr></thead>
+    <tbody>
+    {% for a in upcoming %}
+      <tr>
+        <td><strong>{{ a.start_time.strftime('%d.%m.%Y') }}</strong><br><span style="color:var(--muted);">{{ a.start_time.strftime('%H:%M') }} – {{ a.end_time.strftime('%H:%M') }}</span></td>
+        <td>{{ a.client.full_name }}</td>
+        <td>{{ a.client.phone or '—' }}</td>
+        <td>{{ a.service.name }} <span class="badge muted">{{ a.service.price }} ₽</span></td>
+        <td>
+          <form method="POST" action="/appointments/complete/{{ a.id }}" class="inline-form">
+            <button type="submit" class="btn btn-success btn-sm">Выполнено</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p style="color:var(--muted);">Предстоящих записей нет</p>{% endif %}
+</div>
+
+<div class="card">
+  <h2>Недавние отзывы</h2>
+  {% if reviews %}
+    {% for r in reviews %}
+      <div style="padding: 14px; border-bottom: 1px solid var(--border);">
+        <div>{{ stars_html(r.rating) | safe }} <strong>{{ r.appointment.client.full_name }}</strong>
+          <span style="color:var(--muted); font-size: 12px;">— {{ r.appointment.service.name }}, {{ r.created_at.strftime('%d.%m.%Y') }}</span>
+        </div>
+        {% if r.comment %}<div style="color: var(--text); margin-top: 6px;">{{ r.comment }}</div>{% endif %}
+      </div>
+    {% endfor %}
+  {% else %}<p style="color:var(--muted);">Отзывов пока нет</p>{% endif %}
+</div>
+
+<div class="card">
+  <h2>Последние выполненные</h2>
+  {% if completed %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Дата</th><th>Клиент</th><th>Услуга</th><th>Оценка</th></tr></thead>
+    <tbody>
+    {% for a in completed %}
+      <tr>
+        <td>{{ a.start_time.strftime('%d.%m.%Y %H:%M') }}</td>
+        <td>{{ a.client.full_name }}</td>
+        <td>{{ a.service.name }}</td>
+        <td>{% if a.review %}{{ stars_html(a.review.rating) | safe }}{% else %}<em style="color:var(--muted);">без оценки</em>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</div>
+"""
+    return render_template_string(page('Мой кабинет', content),
+                                  master=master, upcoming=upcoming, completed=completed,
+                                  reviews=reviews, total_completed=total_completed,
+                                  month_revenue=month_revenue)
+
+
+@app.route('/cabinet/master/schedule', methods=['GET', 'POST'])
+@login_required(role='master')
+def master_schedule():
+    user = current_user()
+    master = user.master_profile
+    if not master:
+        return redirect(url_for('logout'))
+
+    if request.method == 'POST':
+        date_str = request.form.get('work_date')
+        day_type = request.form.get('day_type')
+        custom_start = request.form.get('custom_start') or None
+        custom_end = request.form.get('custom_end') or None
+        note = request.form.get('note', '').strip()
+
+        try:
+            wd = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            flash('Некорректная дата', 'error')
+            return redirect(url_for('master_schedule'))
+
+        existing = Schedule.query.filter_by(master_id=master.id, work_date=wd).first()
+        cs = ce = None
+        if custom_start:
+            try: cs = datetime.strptime(custom_start, '%H:%M').time()
+            except ValueError: pass
+        if custom_end:
+            try: ce = datetime.strptime(custom_end, '%H:%M').time()
+            except ValueError: pass
+
+        if existing:
+            existing.day_type = day_type
+            existing.custom_start = cs
+            existing.custom_end = ce
+            existing.note = note
+        else:
+            sched = Schedule(master_id=master.id, work_date=wd, day_type=day_type,
+                             custom_start=cs, custom_end=ce, note=note)
+            db.session.add(sched)
+        db.session.commit()
+        flash('Расписание обновлено', 'success')
+        return redirect(url_for('master_schedule'))
+
+    today = date.today()
+    schedules = Schedule.query.filter(
+        Schedule.master_id == master.id,
+        Schedule.work_date >= today
+    ).order_by(Schedule.work_date).all()
+
+    content = """
+<h1>Моё расписание</h1>
+<p class="subtitle">Базовый график: {{ master.work_start.strftime('%H:%M') }} – {{ master.work_end.strftime('%H:%M') }}.
+Здесь можно отметить отпуск, больничный, выходной или изменить часы на конкретный день.</p>
+
+<div class="card">
+  <h2>Добавить отметку</h2>
+  <form method="POST">
+    <div class="row-2">
+      <div class="form-group"><label>Дата *</label><input type="date" name="work_date" required></div>
+      <div class="form-group"><label>Тип дня *</label>
+        <select name="day_type" required>
+          <option value="work">Рабочий (с другими часами)</option>
+          <option value="vacation">Отпуск</option>
+          <option value="sick">Больничный</option>
+          <option value="dayoff">Выходной</option>
+        </select>
+      </div>
+    </div>
+    <div class="row-2">
+      <div class="form-group"><label>Начало (для рабочего дня)</label><input type="time" name="custom_start"></div>
+      <div class="form-group"><label>Конец</label><input type="time" name="custom_end"></div>
+    </div>
+    <div class="form-group"><label>Комментарий</label><input type="text" name="note" placeholder="например, отпуск до 15.06"></div>
+    <button type="submit" class="btn">Сохранить</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Запланированные отметки</h2>
+  {% if schedules %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Дата</th><th>Тип</th><th>Часы</th><th>Комментарий</th><th></th></tr></thead>
+    <tbody>
+    {% for s in schedules %}
+      <tr>
+        <td><strong>{{ s.work_date.strftime('%d.%m.%Y') }}</strong></td>
+        <td>
+          {% if s.day_type == 'work' %}<span class="badge info">Рабочий</span>
+          {% elif s.day_type == 'vacation' %}<span class="badge rose">Отпуск</span>
+          {% elif s.day_type == 'sick' %}<span class="badge muted">Больничный</span>
+          {% else %}<span class="badge muted">Выходной</span>{% endif %}
+        </td>
+        <td>{% if s.custom_start and s.custom_end %}{{ s.custom_start.strftime('%H:%M') }}–{{ s.custom_end.strftime('%H:%M') }}{% else %}—{% endif %}</td>
+        <td>{{ s.note or '' }}</td>
+        <td>
+          <form method="POST" action="/cabinet/master/schedule/delete/{{ s.id }}" class="inline-form">
+            <button type="submit" class="btn btn-danger btn-sm">Удалить</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p style="color:var(--muted);">Нет особых отметок — работаете по базовому графику</p>{% endif %}
+</div>
+"""
+    return render_template_string(page('Расписание', content),
+                                  master=master, schedules=schedules)
+
+
+@app.route('/cabinet/master/schedule/delete/<int:sid>', methods=['POST'])
+@login_required(role='master')
+def master_schedule_delete(sid):
+    user = current_user()
+    s = Schedule.query.get_or_404(sid)
+    if s.master_id != user.master_id:
+        abort(403)
+    db.session.delete(s)
+    db.session.commit()
+    flash('Отметка удалена', 'success')
+    return redirect(url_for('master_schedule'))
+
+
+# Страница расписания для админа (общий вид по всем мастерам)
+@app.route('/schedule', methods=['GET', 'POST'])
+@login_required(role='admin')
+def admin_schedule():
+    if request.method == 'POST':
+        master_id = request.form.get('master_id')
+        date_str = request.form.get('work_date')
+        day_type = request.form.get('day_type')
+        note = request.form.get('note', '').strip()
+
+        try:
+            wd = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            flash('Некорректная дата', 'error')
+            return redirect(url_for('admin_schedule'))
+
+        existing = Schedule.query.filter_by(master_id=master_id, work_date=wd).first()
+        if existing:
+            existing.day_type = day_type
+            existing.note = note
+        else:
+            sched = Schedule(master_id=master_id, work_date=wd, day_type=day_type, note=note)
+            db.session.add(sched)
+        db.session.commit()
+        flash('Отметка добавлена', 'success')
+        return redirect(url_for('admin_schedule'))
+
+    today = date.today()
+    horizon_end = today + timedelta(days=30)
+    schedules = Schedule.query.filter(
+        Schedule.work_date >= today,
+        Schedule.work_date <= horizon_end
+    ).order_by(Schedule.work_date).all()
+    masters = Master.query.all()
+
+    content = """
+<h1>Учёт рабочего времени</h1>
+<p class="subtitle">Отпуска, больничные и индивидуальный график мастеров на ближайшие 30 дней</p>
+
+<div class="card">
+  <h2>Назначить мастеру</h2>
+  <form method="POST">
+    <div class="row-3">
+      <div class="form-group"><label>Мастер</label>
+        <select name="master_id" required>
+        {% for m in masters %}<option value="{{ m.id }}">{{ m.full_name }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="form-group"><label>Дата</label><input type="date" name="work_date" required></div>
+      <div class="form-group"><label>Тип</label>
+        <select name="day_type" required>
+          <option value="vacation">Отпуск</option>
+          <option value="sick">Больничный</option>
+          <option value="dayoff">Выходной</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group"><label>Комментарий</label><input type="text" name="note"></div>
+    <button type="submit" class="btn">Добавить</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Запланировано</h2>
+  {% if schedules %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Мастер</th><th>Дата</th><th>Тип</th><th>Комментарий</th></tr></thead>
+    <tbody>
+    {% for s in schedules %}
+      <tr>
+        <td><strong>{{ s.master.full_name }}</strong></td>
+        <td>{{ s.work_date.strftime('%d.%m.%Y') }}</td>
+        <td>
+          {% if s.day_type == 'work' %}<span class="badge info">Рабочий</span>
+          {% elif s.day_type == 'vacation' %}<span class="badge rose">Отпуск</span>
+          {% elif s.day_type == 'sick' %}<span class="badge muted">Больничный</span>
+          {% else %}<span class="badge muted">Выходной</span>{% endif %}
+        </td>
+        <td>{{ s.note or '' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p style="color:var(--muted);">Нет запланированных отпусков и выходных</p>{% endif %}
+</div>
+"""
+    return render_template_string(page('Расписание мастеров', content),
+                                  schedules=schedules, masters=masters)
+
+
+# ============ ЛИЧНЫЙ КАБИНЕТ КЛИЕНТА ============
+
+@app.route('/cabinet/client')
+@login_required(role='client')
+def client_cabinet():
+    user = current_user()
+    client = user.client_profile
+    if not client:
+        flash('Профиль клиента не найден', 'error')
+        return redirect(url_for('logout'))
+
+    now = datetime.now()
+    upcoming = Appointment.query.filter(
+        Appointment.client_id == client.id,
+        Appointment.status == 'active',
+        Appointment.start_time >= now
+    ).order_by(Appointment.start_time).all()
+
+    past = Appointment.query.filter(
+        Appointment.client_id == client.id,
+        Appointment.status.in_(['completed', 'active']),
+        Appointment.start_time < now
+    ).order_by(Appointment.start_time.desc()).all()
+
+    cancelled = Appointment.query.filter(
+        Appointment.client_id == client.id,
+        Appointment.status == 'cancelled'
+    ).order_by(Appointment.start_time.desc()).limit(10).all()
+
+    content = """
+<div class="hero">
+  <h1>Здравствуйте, <span class="accent">{{ client.first_name }}</span>!</h1>
+  <p>Ваш личный кабинет. Здесь видно все ваши записи, можно отменить предстоящие
+     или оставить отзыв о пройденной процедуре.</p>
+  <div style="margin-top: 16px;">
+    <a href="/cabinet/client/book" class="btn">+ Новая запись</a>
+    <a href="/services-public" class="btn btn-outline">Каталог услуг</a>
+  </div>
+</div>
+
+<div class="stats-grid">
+  <div class="stat-card"><div class="icon">📅</div><div class="number">{{ upcoming|length }}</div><div class="label">Предстоящих записей</div></div>
+  <div class="stat-card"><div class="icon">✓</div><div class="number">{{ past|length }}</div><div class="label">Пройдено процедур</div></div>
+  <div class="stat-card"><div class="icon">✕</div><div class="number">{{ cancelled|length }}</div><div class="label">Отменено</div></div>
+</div>
+
+<div class="card">
+  <h2>Предстоящие записи</h2>
+  {% if upcoming %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Дата и время</th><th>Услуга</th><th>Мастер</th><th>Стоимость</th><th>Действия</th></tr></thead>
+    <tbody>
+    {% for a in upcoming %}
+      <tr>
+        <td><strong>{{ a.start_time.strftime('%d.%m.%Y') }}</strong><br><span style="color:var(--muted);">{{ a.start_time.strftime('%H:%M') }}</span></td>
+        <td>{{ a.service.name }}</td>
+        <td>{{ a.master.full_name }} <small style="color:var(--muted);">({{ a.master.rating }}★)</small></td>
+        <td><strong style="color:var(--gold);">{{ a.service.price }} ₽</strong></td>
+        <td>
+          <form method="POST" action="/appointments/cancel/{{ a.id }}" class="inline-form"
+                onsubmit="return confirm('Отменить запись?')">
+            <button type="submit" class="btn btn-danger btn-sm">Отменить</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+    <p style="color:var(--muted);">Предстоящих записей нет.</p>
+    <a href="/cabinet/client/book" class="btn">Записаться</a>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Пройденные процедуры</h2>
+  {% if past %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Дата</th><th>Услуга</th><th>Мастер</th><th>Цена</th><th>Ваша оценка</th></tr></thead>
+    <tbody>
+    {% for a in past %}
+      <tr>
+        <td>{{ a.start_time.strftime('%d.%m.%Y %H:%M') }}</td>
+        <td>{{ a.service.name }}</td>
+        <td>{{ a.master.full_name }}</td>
+        <td>{{ a.service.price }} ₽</td>
+        <td>
+          {% if a.review %}
+            {{ stars_html(a.review.rating) | safe }}
+            {% if a.review.comment %}<br><small style="color:var(--muted);">{{ a.review.comment }}</small>{% endif %}
+          {% else %}
+            <a href="/cabinet/client/review/{{ a.id }}" class="btn btn-outline btn-sm">Оценить</a>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p style="color:var(--muted);">История пуста</p>{% endif %}
+</div>
+"""
+    return render_template_string(page('Мой кабинет', content),
+                                  client=client, upcoming=upcoming, past=past, cancelled=cancelled)
+
+
+@app.route('/cabinet/client/book', methods=['GET', 'POST'])
+@login_required(role='client')
+def client_book():
+    user = current_user()
+    client = user.client_profile
+
+    if request.method == 'POST':
+        service_id = request.form.get('service_id')
+        master_id = request.form.get('master_id')
+        date_str = request.form.get('date')
+        time_str = request.form.get('time')
+
+        if not all([service_id, date_str, time_str]):
+            flash('Заполните все поля', 'error')
+            return redirect(url_for('client_book'))
+        try:
+            start_time = datetime.strptime(f'{date_str} {time_str}', '%Y-%m-%d %H:%M')
+        except ValueError:
+            flash('Некорректная дата/время', 'error')
+            return redirect(url_for('client_book'))
+
+        if start_time < datetime.now():
+            flash('Нельзя записаться на прошедшее время', 'error')
+            return redirect(url_for('client_book'))
+
+        service = Service.query.get(service_id)
+        if not service:
+            flash('Услуга не найдена', 'error')
+            return redirect(url_for('client_book'))
+        end_time = start_time + timedelta(minutes=service.duration)
+
+        if master_id and master_id != 'auto':
+            master = Master.query.get(master_id)
+            if not master or service not in master.services:
+                flash('Этот мастер не оказывает выбранную услугу', 'error')
+                return redirect(url_for('client_book'))
+            if not is_master_available(master.id, start_time, end_time):
+                flash(f'Мастер {master.full_name} занят в это время', 'error')
+                return redirect(url_for('client_book'))
+        else:
+            master = find_optimal_master(int(service_id), start_time, end_time)
+            if not master:
+                flash('Нет свободных мастеров на это время. Попробуйте другой слот.', 'error')
+                return redirect(url_for('client_book'))
+
+        a = Appointment(client_id=client.id, master_id=master.id, service_id=service.id,
+                        start_time=start_time, end_time=end_time)
+        db.session.add(a)
+        db.session.commit()
+        flash(f'Записаны к мастеру {master.full_name} на {start_time.strftime("%d.%m.%Y %H:%M")}', 'success')
+        return redirect(url_for('client_cabinet'))
+
+    services = Service.query.all()
+    masters = Master.query.all()
+    content = """
+<h1>Запись на услугу</h1>
+<p class="subtitle">Выберите услугу, дату и время. Мастера можно выбрать или доверить системе.</p>
+<div class="card">
+  <form method="POST">
+    <div class="form-group"><label>Услуга *</label>
+      <select name="service_id" required>
+        <option value="">— выберите услугу —</option>
+        {% for s in services %}<option value="{{ s.id }}">{{ s.name }} — {{ s.duration }} мин · {{ s.price }} ₽</option>{% endfor %}
+      </select>
+    </div>
+    <div class="form-group"><label>Мастер</label>
+      <select name="master_id">
+        <option value="auto">⭐ Подобрать самого рейтингового свободного</option>
+        {% for m in masters %}<option value="{{ m.id }}">{{ m.full_name }} — рейтинг {{ m.rating }}/5</option>{% endfor %}
+      </select>
+    </div>
+    <div class="row-2">
+      <div class="form-group"><label>Дата *</label><input type="date" name="date" required></div>
+      <div class="form-group"><label>Время *</label><input type="time" name="time" required></div>
+    </div>
+    <button type="submit" class="btn">Записаться</button>
+    <a href="/cabinet/client" class="btn btn-grey">Отмена</a>
+  </form>
+</div>
+"""
+    return render_template_string(page('Запись', content),
+                                  services=services, masters=masters)
+
+
+@app.route('/cabinet/client/review/<int:app_id>', methods=['GET', 'POST'])
+@login_required(role='client')
+def client_review(app_id):
+    user = current_user()
+    a = Appointment.query.get_or_404(app_id)
+    if a.client_id != user.client_id:
+        abort(403)
+    if a.review:
+        flash('Вы уже оставили отзыв на эту процедуру', 'error')
+        return redirect(url_for('client_cabinet'))
+
+    if request.method == 'POST':
+        try:
+            rating = int(request.form.get('rating'))
+        except (TypeError, ValueError):
+            flash('Поставьте оценку', 'error')
+            return redirect(url_for('client_review', app_id=app_id))
+        if rating < 1 or rating > 5:
+            flash('Оценка должна быть от 1 до 5', 'error')
+            return redirect(url_for('client_review', app_id=app_id))
+        comment = request.form.get('comment', '').strip()
+        r = Review(appointment_id=a.id, rating=rating, comment=comment)
+        # автоматически переводим в completed, если ещё active
+        if a.status == 'active':
+            a.status = 'completed'
+        db.session.add(r)
+        db.session.commit()
+        flash('Спасибо за отзыв!', 'success')
+        return redirect(url_for('client_cabinet'))
+
+    content = """
+<h1>Оценить процедуру</h1>
+<p class="subtitle">{{ a.service.name }} · мастер {{ a.master.full_name }} · {{ a.start_time.strftime('%d.%m.%Y %H:%M') }}</p>
+
+<div class="card">
+  <form method="POST">
+    <div class="form-group">
+      <label>Ваша оценка</label>
+      <div class="rating-input">
+        <input type="radio" name="rating" value="5" id="r5"><label for="r5">★</label>
+        <input type="radio" name="rating" value="4" id="r4"><label for="r4">★</label>
+        <input type="radio" name="rating" value="3" id="r3"><label for="r3">★</label>
+        <input type="radio" name="rating" value="2" id="r2"><label for="r2">★</label>
+        <input type="radio" name="rating" value="1" id="r1"><label for="r1">★</label>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Комментарий (необязательно)</label>
+      <textarea name="comment" rows="4" placeholder="Поделитесь впечатлениями"></textarea>
+    </div>
+    <button type="submit" class="btn">Отправить</button>
+    <a href="/cabinet/client" class="btn btn-grey">Отмена</a>
+  </form>
+</div>
+"""
+    return render_template_string(page('Оценить', content), a=a)
+
+
+# ============ АНАЛИТИКА ============
+
+@app.route('/analytics')
+@login_required(role='admin')
+def analytics():
+    period_days = int(request.args.get('days', 30))
+    period_start = datetime.now() - timedelta(days=period_days)
+
+    master_stats = []
+    for master in Master.query.all():
+        app_list = Appointment.query.filter(
+            Appointment.master_id == master.id,
+            Appointment.status.in_(['active', 'completed']),
+            Appointment.start_time >= period_start
+        ).all()
+        total_minutes = sum(int((a.end_time - a.start_time).total_seconds() / 60) for a in app_list)
+        total_revenue = sum(a.service.price for a in app_list)
+        # 11 рабочих часов * 30 дней = 19800 минут
+        max_minutes = 11 * 60 * period_days
+        load_percent = round((total_minutes / max_minutes) * 100, 1) if total_minutes else 0
+        master_stats.append({
+            'name': master.full_name,
+            'count': len(app_list),
+            'hours': round(total_minutes / 60, 1),
+            'revenue': round(total_revenue, 2),
+            'load_percent': min(load_percent, 100),
+            'rating': master.rating,
+        })
+    master_stats.sort(key=lambda x: x['revenue'], reverse=True)
+
+    service_stats = db.session.query(
+        Service.name, func.count(Appointment.id).label('cnt'),
+        func.sum(Service.price).label('rev')
+    ).join(Appointment).filter(
+        Appointment.status.in_(['active', 'completed']),
+        Appointment.start_time >= period_start
+    ).group_by(Service.id).order_by(func.count(Appointment.id).desc()).all()
+
+    # данные для Chart.js
+    import json
+    chart_data = {
+        'master_labels': [m['name'] for m in master_stats],
+        'master_revenue': [m['revenue'] for m in master_stats],
+        'master_count': [m['count'] for m in master_stats],
+        'master_rating': [m['rating'] for m in master_stats],
+        'service_labels': [s.name for s in service_stats],
+        'service_count': [s.cnt for s in service_stats],
+        'service_revenue': [float(s.rev or 0) for s in service_stats],
+    }
+
+    content = """
+<h1>Аналитика</h1>
+<p class="subtitle">Данные за последние {{ days }} дней</p>
+
+<div class="card">
+  <form method="GET" style="display:flex; gap:10px; align-items:end; flex-wrap:wrap;">
+    <div class="form-group" style="margin-bottom:0;">
+      <label>Период (дней)</label>
+      <select name="days" onchange="this.form.submit()">
+        <option value="7" {% if days==7 %}selected{% endif %}>7 дней</option>
+        <option value="30" {% if days==30 %}selected{% endif %}>30 дней</option>
+        <option value="90" {% if days==90 %}selected{% endif %}>90 дней</option>
+        <option value="365" {% if days==365 %}selected{% endif %}>Год</option>
+      </select>
+    </div>
+    <a href="/export/analytics?days={{ days }}" class="btn btn-outline">⬇ Excel</a>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Выручка и записи мастеров</h2>
+  <div class="chart-controls">
+    <button data-type="bar" data-target="masterChart" data-metric="revenue" class="active">Выручка (бар)</button>
+    <button data-type="pie" data-target="masterChart" data-metric="revenue">Выручка (пирог)</button>
+    <button data-type="doughnut" data-target="masterChart" data-metric="revenue">Выручка (донут)</button>
+    <button data-type="bar" data-target="masterChart" data-metric="count">Кол-во записей</button>
+    <button data-type="line" data-target="masterChart" data-metric="rating">Рейтинги</button>
+  </div>
+  <div class="chart-box"><canvas id="masterChart"></canvas></div>
+</div>
+
+<div class="card">
+  <h2>Популярность услуг</h2>
+  <div class="chart-controls">
+    <button data-type="doughnut" data-target="serviceChart" data-metric="count" class="active">Записи (донут)</button>
+    <button data-type="pie" data-target="serviceChart" data-metric="count">Записи (пирог)</button>
+    <button data-type="bar" data-target="serviceChart" data-metric="count">Записи (бар)</button>
+    <button data-type="bar" data-target="serviceChart" data-metric="revenue">Выручка по услугам</button>
+  </div>
+  <div class="chart-box"><canvas id="serviceChart"></canvas></div>
+</div>
+
+<div class="card">
+  <h2>Загрузка мастеров</h2>
+  {% if master_stats %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Мастер</th><th>Рейтинг</th><th>Записей</th><th>Часов</th><th>Выручка</th><th style="width:25%;">Загрузка</th></tr></thead>
+    <tbody>
+    {% for m in master_stats %}
+      <tr>
+        <td><strong>{{ m.name }}</strong></td>
+        <td>{{ stars_html(m.rating) | safe }} <small style="color:var(--muted);">{{ m.rating }}</small></td>
+        <td>{{ m.count }}</td>
+        <td>{{ m.hours }} ч</td>
+        <td><strong style="color:var(--gold);">{{ m.revenue }} ₽</strong></td>
+        <td><div class="progress-bar"><div class="progress-fill" style="width:{{ m.load_percent }}%;">{{ m.load_percent }}%</div></div></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}<p style="color:var(--muted);">Данных пока нет</p>{% endif %}
+</div>
+
+<script>
+const chartData = {{ chart_data | tojson | safe }};
+Chart.defaults.color = '#ece7e0';
+Chart.defaults.borderColor = 'rgba(212,175,55,0.18)';
+
+const goldPalette = ['#d4af37','#e8c97a','#e8a4b8','#8ab4ff','#4dd4a8','#c89bd4','#f0a675','#a4d4e8','#d4a4a4','#a4d4a4'];
+
+let masterChart, serviceChart;
+
+function makeChart(canvasId, type, labels, data, label) {
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  if (canvasId === 'masterChart' && masterChart) masterChart.destroy();
+  if (canvasId === 'serviceChart' && serviceChart) serviceChart.destroy();
+
+  const config = {
+    type: type,
+    data: {
+      labels: labels,
+      datasets: [{
+        label: label,
+        data: data,
+        backgroundColor: type === 'line'
+          ? 'rgba(212,175,55,0.2)'
+          : labels.map((_, i) => goldPalette[i % goldPalette.length]),
+        borderColor: type === 'line' ? '#d4af37' : 'rgba(15,13,26,0.4)',
+        borderWidth: type === 'line' ? 3 : 1.5,
+        fill: type === 'line',
+        tension: 0.35,
+        pointRadius: 5,
+        pointBackgroundColor: '#d4af37',
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: ['pie','doughnut'].includes(type), position: 'right' },
+        tooltip: { backgroundColor: 'rgba(28,23,49,0.95)', borderColor: '#d4af37', borderWidth: 1 }
+      },
+      scales: ['pie','doughnut'].includes(type) ? {} : {
+        x: { grid: { color: 'rgba(212,175,55,0.08)' } },
+        y: { grid: { color: 'rgba(212,175,55,0.08)' }, beginAtZero: true }
+      }
+    }
+  };
+  const chart = new Chart(ctx, config);
+  if (canvasId === 'masterChart') masterChart = chart;
+  else serviceChart = chart;
+}
+
+function getMetricData(target, metric) {
+  if (target === 'masterChart') {
+    if (metric === 'revenue') return { labels: chartData.master_labels, data: chartData.master_revenue, label: 'Выручка ₽' };
+    if (metric === 'count') return { labels: chartData.master_labels, data: chartData.master_count, label: 'Записей' };
+    if (metric === 'rating') return { labels: chartData.master_labels, data: chartData.master_rating, label: 'Средний рейтинг' };
+  } else {
+    if (metric === 'count') return { labels: chartData.service_labels, data: chartData.service_count, label: 'Записей' };
+    if (metric === 'revenue') return { labels: chartData.service_labels, data: chartData.service_revenue, label: 'Выручка ₽' };
+  }
+}
+
+document.querySelectorAll('.chart-controls button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const target = btn.dataset.target;
+    const type = btn.dataset.type;
+    const metric = btn.dataset.metric;
+    document.querySelectorAll(`.chart-controls button[data-target="${target}"]`).forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const md = getMetricData(target, metric);
+    makeChart(target, type, md.labels, md.data, md.label);
+  });
+});
+
+// первичная отрисовка
+makeChart('masterChart', 'bar', chartData.master_labels, chartData.master_revenue, 'Выручка ₽');
+makeChart('serviceChart', 'doughnut', chartData.service_labels, chartData.service_count, 'Записей');
+</script>
+"""
+    return render_template_string(page('Аналитика', content),
+                                  master_stats=master_stats, service_stats=service_stats,
+                                  chart_data=chart_data, days=period_days)
+
+
+# ============ ЭКСПОРТ В EXCEL ============
+
+def _xlsx_styled_workbook():
+    """Базовая книга с готовыми стилями."""
+    wb = Workbook()
+    return wb
+
+
+def _apply_header(ws, headers):
+    """Заголовок таблицы со стилем."""
+    for col, h in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = Font(bold=True, color='FFFFFF', size=11)
+        cell.fill = PatternFill('solid', fgColor='5B4A8A')
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+    ws.row_dimensions[1].height = 24
+
+
+def _autosize(ws):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            v = cell.value
+            if v is not None:
+                max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[col_letter].width = min(max_len + 4, 50)
+
+
+@app.route('/export/appointments')
+@login_required(role='admin')
+def export_appointments():
+    filter_date = request.args.get('date', '')
+    filter_status = request.args.get('status', 'all')
+    query = Appointment.query
+    if filter_status != 'all':
+        query = query.filter(Appointment.status == filter_status)
+    if filter_date:
+        try:
+            d = datetime.strptime(filter_date, '%Y-%m-%d').date()
+            query = query.filter(Appointment.start_time >= datetime.combine(d, time.min),
+                                 Appointment.start_time <= datetime.combine(d, time.max))
+        except ValueError:
+            pass
+    appointments = query.order_by(Appointment.start_time.desc()).all()
+
+    wb = _xlsx_styled_workbook()
+    ws = wb.active
+    ws.title = 'Записи'
+    headers = ['Дата', 'Время', 'Клиент', 'Телефон', 'Услуга', 'Длительность',
+               'Мастер', 'Рейтинг мастера', 'Стоимость', 'Статус']
+    _apply_header(ws, headers)
+
+    status_ru = {'active': 'Активна', 'completed': 'Выполнена', 'cancelled': 'Отменена'}
+    for i, a in enumerate(appointments, start=2):
+        ws.cell(row=i, column=1, value=a.start_time.strftime('%d.%m.%Y'))
+        ws.cell(row=i, column=2, value=a.start_time.strftime('%H:%M'))
+        ws.cell(row=i, column=3, value=a.client.full_name)
+        ws.cell(row=i, column=4, value=a.client.phone or '')
+        ws.cell(row=i, column=5, value=a.service.name)
+        ws.cell(row=i, column=6, value=f'{a.service.duration} мин')
+        ws.cell(row=i, column=7, value=a.master.full_name)
+        ws.cell(row=i, column=8, value=a.master.rating)
+        ws.cell(row=i, column=9, value=a.service.price)
+        ws.cell(row=i, column=10, value=status_ru.get(a.status, a.status))
+
+    _autosize(ws)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f'appointments_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'
+    return send_file(buf, as_attachment=True, download_name=fname,
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+@app.route('/export/analytics')
+@login_required(role='admin')
+def export_analytics():
+    period_days = int(request.args.get('days', 30))
+    period_start = datetime.now() - timedelta(days=period_days)
+
+    wb = _xlsx_styled_workbook()
+    # Лист 1 — мастера
+    ws1 = wb.active
+    ws1.title = 'Мастера'
+    _apply_header(ws1, ['Мастер', 'Рейтинг', 'Записей', 'Часов', 'Выручка ₽', 'Загрузка %'])
+
+    row = 2
+    max_minutes = 11 * 60 * period_days
+    for master in Master.query.all():
+        apps = Appointment.query.filter(
+            Appointment.master_id == master.id,
+            Appointment.status.in_(['active', 'completed']),
+            Appointment.start_time >= period_start
+        ).all()
+        total_min = sum(int((a.end_time - a.start_time).total_seconds() / 60) for a in apps)
+        total_rev = sum(a.service.price for a in apps)
+        load = round((total_min / max_minutes) * 100, 1) if total_min else 0
+        ws1.cell(row=row, column=1, value=master.full_name)
+        ws1.cell(row=row, column=2, value=master.rating)
+        ws1.cell(row=row, column=3, value=len(apps))
+        ws1.cell(row=row, column=4, value=round(total_min / 60, 1))
+        ws1.cell(row=row, column=5, value=round(total_rev, 2))
+        ws1.cell(row=row, column=6, value=min(load, 100))
+        row += 1
+    _autosize(ws1)
+
+    # Лист 2 — услуги
+    ws2 = wb.create_sheet('Услуги')
+    _apply_header(ws2, ['Услуга', 'Записей', 'Выручка ₽', 'Средняя цена ₽'])
+    service_stats = db.session.query(
+        Service.name, func.count(Appointment.id),
+        func.sum(Service.price), func.avg(Service.price)
+    ).join(Appointment).filter(
+        Appointment.status.in_(['active', 'completed']),
+        Appointment.start_time >= period_start
+    ).group_by(Service.id).all()
+    for r, (name, cnt, rev, avg) in enumerate(service_stats, start=2):
+        ws2.cell(row=r, column=1, value=name)
+        ws2.cell(row=r, column=2, value=cnt)
+        ws2.cell(row=r, column=3, value=round(float(rev or 0), 2))
+        ws2.cell(row=r, column=4, value=round(float(avg or 0), 2))
+    _autosize(ws2)
+
+    # Лист 3 — сводка
+    ws3 = wb.create_sheet('Сводка')
+    ws3['A1'] = 'Показатель'
+    ws3['B1'] = 'Значение'
+    for c in (ws3['A1'], ws3['B1']):
+        c.font = Font(bold=True, color='FFFFFF')
+        c.fill = PatternFill('solid', fgColor='5B4A8A')
+    total_apps = Appointment.query.filter(
+        Appointment.status.in_(['active', 'completed']),
+        Appointment.start_time >= period_start
+    ).count()
+    total_revenue = db.session.query(func.sum(Service.price)).join(Appointment).filter(
+        Appointment.status.in_(['active', 'completed']),
+        Appointment.start_time >= period_start
+    ).scalar() or 0
+    cancelled = Appointment.query.filter(
+        Appointment.status == 'cancelled',
+        Appointment.start_time >= period_start
+    ).count()
+    rows = [
+        ('Период (дней)', period_days),
+        ('Всего записей', total_apps),
+        ('Отменено записей', cancelled),
+        ('Общая выручка ₽', round(total_revenue, 2)),
+        ('Активных мастеров', Master.query.count()),
+        ('Услуг в каталоге', Service.query.count()),
+        ('Клиентов', Client.query.count()),
+    ]
+    for i, (k, v) in enumerate(rows, start=2):
+        ws3.cell(row=i, column=1, value=k)
+        ws3.cell(row=i, column=2, value=v)
+    _autosize(ws3)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f'analytics_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'
+    return send_file(buf, as_attachment=True, download_name=fname,
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+# ============ ГЕНЕТИЧЕСКАЯ ОПТИМИЗАЦИЯ ============
+
+@app.route('/genetic', methods=['GET', 'POST'])
+@login_required(role='admin')
+def genetic_page():
+    """
+    Демонстрация генетического алгоритма.
+    Админ задаёт пул заявок (или генерируется автоматически), GA подбирает
+    оптимальное распределение по мастерам и времени дня.
+    """
+    services = Service.query.all()
+    masters = Master.query.all()
+
+    result = None
+    if request.method == 'POST':
+        date_str = request.form.get('date')
+        try:
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            flash('Укажите корректную дату', 'error')
+            return redirect(url_for('genetic_page'))
+
+        # собираем заявки из формы (service_ids списком)
+        requested_services = request.form.getlist('req_service')
+        if not requested_services:
+            flash('Добавьте хотя бы одну заявку', 'error')
+            return redirect(url_for('genetic_page'))
+
+        requests_list = []
+        for sid in requested_services:
+            s = Service.query.get(sid)
+            if s:
+                requests_list.append({'service_id': s.id, 'duration': s.duration, 'name': s.name})
+
+        # параметры GA
+        try:
+            pop = int(request.form.get('pop', 30))
+            gens = int(request.form.get('gens', 50))
+            mut = float(request.form.get('mut', 0.15))
+        except ValueError:
+            pop, gens, mut = 30, 50, 0.15
+
+        ga = GeneticScheduler(requests_list, target_date,
+                              population_size=pop, generations=gens,
+                              mutation_rate=mut)
+        best, score, history = ga.run()
+
+        # формируем результат для отображения
+        assignments = []
+        for i, gene in enumerate(best):
+            mid, start_min = gene
+            m = Master.query.get(mid) if mid else None
+            req = requests_list[i]
+            h, mn = divmod(start_min, 60)
+            assignments.append({
+                'service': req['name'],
+                'duration': req['duration'],
+                'master': m.full_name if m else '— (нет подходящего)',
+                'rating': m.rating if m else 0,
+                'start': f'{h:02d}:{mn:02d}',
+                'end': f'{(start_min+req["duration"])//60:02d}:{(start_min+req["duration"])%60:02d}',
+                'master_id': mid,
+            })
+        # упорядочим по времени
+        assignments.sort(key=lambda x: x['start'])
+
+        result = {
+            'score': round(score, 2),
+            'history': history,
+            'assignments': assignments,
+            'target_date': target_date.strftime('%d.%m.%Y'),
+            'gens': gens,
+            'pop': pop,
+        }
+
+    import json
+    history_json = json.dumps(result['history']) if result else '[]'
+
+    content = """
+<h1>Генетический алгоритм оптимизации</h1>
+<p class="subtitle">Распределение пула заявок по мастерам и времени дня с учётом конфликтов,
+рабочих часов, отпусков и рейтингов мастеров.</p>
+
+<div class="card">
+  <h2>Как это работает</h2>
+  <p style="color:var(--muted);">
+    Хромосома — список «(мастер, время начала)» для каждой заявки. Мутация заменяет случайный ген,
+    кроссинговер склеивает половины двух родителей. Fitness даёт бонус за высокий рейтинг назначенного
+    мастера, штраф — за конфликты времени, выход за рабочие часы, отпуск, неоказание услуги
+    и неравномерную загрузку мастеров. После N поколений алгоритм возвращает лучшее найденное решение.
+  </p>
+</div>
+
+<div class="card">
+  <h2>Параметры запуска</h2>
+  <form method="POST">
+    <div class="row-3">
+      <div class="form-group"><label>Дата</label><input type="date" name="date" required></div>
+      <div class="form-group"><label>Размер популяции</label><input type="number" name="pop" value="30" min="10" max="200"></div>
+      <div class="form-group"><label>Поколений</label><input type="number" name="gens" value="50" min="10" max="500"></div>
+    </div>
+    <div class="form-group">
+      <label>Мутация (0..1)</label>
+      <input type="number" name="mut" value="0.15" min="0.01" max="0.9" step="0.01">
+    </div>
+
+    <div class="form-group">
+      <label>Заявки на день (выберите услуги, повторы допустимы)</label>
+      <div class="checkbox-group">
+      {% for s in services %}
+        <label><input type="checkbox" name="req_service" value="{{ s.id }}"> {{ s.name }} ({{ s.duration }} мин)</label>
+      {% endfor %}
+      </div>
+      <p style="color:var(--muted); font-size:12px; margin-top:8px;">
+        Подсказка: чем больше заявок, тем интереснее работает GA. Можно выбрать одну услугу несколько раз —
+        для этого добавьте поля вручную или просто отметьте разные галки.
+      </p>
+    </div>
+    <button type="submit" class="btn">▶ Запустить GA</button>
+  </form>
+</div>
+
+{% if result %}
+<div class="card">
+  <h2>Результат на {{ result.target_date }}</h2>
+  <p><strong>Fitness-оценка лучшего решения:</strong>
+    <span style="color: var(--gold); font-size: 22px;">{{ result.score }}</span></p>
+  <p style="color:var(--muted);">Параметры: популяция {{ result.pop }}, поколений {{ result.gens }}.</p>
+
+  <h2 style="margin-top: 20px;">Распределение записей</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Время</th><th>Услуга</th><th>Длит.</th><th>Мастер</th><th>Рейтинг</th></tr></thead>
+    <tbody>
+    {% for a in result.assignments %}
+      <tr>
+        <td><strong>{{ a.start }} – {{ a.end }}</strong></td>
+        <td>{{ a.service }}</td>
+        <td>{{ a.duration }} мин</td>
+        <td>{{ a.master }}</td>
+        <td>{% if a.master_id %}{{ stars_html(a.rating) | safe }}{% else %}—{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Сходимость алгоритма</h2>
+  <div class="chart-box" style="height: 300px;">
+    <canvas id="convChart"></canvas>
+  </div>
+</div>
+
+<script>
+const history = {{ history_json | safe }};
+const ctx = document.getElementById('convChart').getContext('2d');
+new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: history.map((_, i) => 'Поколение ' + (i+1)),
+    datasets: [{
+      label: 'Лучший fitness',
+      data: history,
+      borderColor: '#d4af37',
+      backgroundColor: 'rgba(212,175,55,0.18)',
+      borderWidth: 3, fill: true, tension: 0.3,
+      pointRadius: 3, pointBackgroundColor: '#e8c97a',
+    }]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { grid: { color: 'rgba(212,175,55,0.08)' } },
+      y: { grid: { color: 'rgba(212,175,55,0.08)' } }
+    }
+  }
+});
+</script>
+{% endif %}
+"""
+    return render_template_string(page('GA-оптимизация', content),
+                                  services=services, masters=masters,
+                                  result=result, history_json=history_json)
+
+
+# ============ ИНИЦИАЛИЗАЦИЯ БД ============
+
+def init_db():
+    db.create_all()
+    if Service.query.count() == 0:
+        services_data = [
+            ('Женская стрижка', 60, 1500),
+            ('Мужская стрижка', 30, 800),
+            ('Окрашивание', 120, 3500),
+            ('Маникюр классический', 60, 1200),
+            ('Педикюр', 90, 1800),
+            ('Укладка', 45, 1000),
+            ('Брови', 30, 600),
+            ('Ламинирование волос', 90, 2800),
+        ]
+        for name, dur, price in services_data:
+            db.session.add(Service(name=name, duration=dur, price=price))
+        db.session.commit()
+
+        all_s = Service.query.all()
+        masters_data = [
+            ('Анна', 'Петрова', '+79001112233', 'anna@aurum.ru', [0, 2, 5, 7], 'anna'),
+            ('Ольга', 'Сидорова', '+79002223344', 'olga@aurum.ru', [0, 1, 5, 7], 'olga'),
+            ('Мария', 'Иванова', '+79003334455', 'maria@aurum.ru', [3, 4, 6], 'maria'),
+            ('Екатерина', 'Кузнецова', '+79004445566', 'ekaterina@aurum.ru', [0, 2, 3, 5], 'ekaterina'),
+            ('Дарья', 'Соколова', '+79005556677', 'darya@aurum.ru', [3, 4, 6], 'darya'),
+        ]
+        for first, last, phone, email, idxs, login in masters_data:
+            m = Master(first_name=first, last_name=last, phone=phone, email=email)
+            m.services = [all_s[i] for i in idxs]
+            db.session.add(m)
+            db.session.flush()
+            u = User(username=login, role='master', master_id=m.id)
+            u.set_password('master')
+            db.session.add(u)
+        db.session.commit()
+
+        # клиенты
+        clients_data = [
+            ('Светлана', 'Морозова', '+79101234567', 'svetlana@mail.ru', 'client'),
+            ('Татьяна', 'Волкова', '+79101234568', 'tatyana@mail.ru', None),
+            ('Елена', 'Зайцева', '+79101234569', 'elena@mail.ru', None),
+            ('Ирина', 'Лебедева', '+79101234570', None, None),
+            ('Юлия', 'Новикова', '+79101234571', 'yulia@mail.ru', None),
+        ]
+        for first, last, phone, email, login in clients_data:
+            c = Client(first_name=first, last_name=last, phone=phone, email=email)
+            db.session.add(c)
+            db.session.flush()
+            if login:
+                u = User(username=login, role='client', client_id=c.id)
+                u.set_password('client')
+                db.session.add(u)
+        db.session.commit()
+
+        # админ
+        admin = User(username='admin', role='admin')
+        admin.set_password('admin')
+        db.session.add(admin)
+        db.session.commit()
+
+        # тестовые записи и отзывы за прошлые 30 дней
+        all_masters = Master.query.all()
+        all_clients = Client.query.all()
+        all_services = Service.query.all()
+        random.seed(42)
+        for i in range(40):
+            days_ago = random.randint(1, 30)
+            hour = random.randint(9, 18)
+            minute = random.choice([0, 15, 30, 45])
+            client = random.choice(all_clients)
+            service = random.choice(all_services)
+            possible_masters = [m for m in all_masters if service in m.services]
+            if not possible_masters:
+                continue
+            master = random.choice(possible_masters)
+            start = datetime.now() - timedelta(days=days_ago)
+            start = start.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            end = start + timedelta(minutes=service.duration)
+            # пропустим, если конфликт
+            conflict = Appointment.query.filter(
+                Appointment.master_id == master.id,
+                Appointment.start_time < end,
+                Appointment.end_time > start
+            ).first()
+            if conflict:
+                continue
+            a = Appointment(client_id=client.id, master_id=master.id, service_id=service.id,
+                            start_time=start, end_time=end, status='completed')
+            db.session.add(a)
+            db.session.flush()
+            # 70% записей — с отзывами
+            if random.random() < 0.7:
+                rating = random.choices([5, 4, 3, 2], weights=[55, 30, 12, 3])[0]
+                comments = ['Отлично!', 'Очень довольна', 'Спасибо!', 'Хороший мастер',
+                            'Рекомендую', 'Профессионально', '', '']
+                r = Review(appointment_id=a.id, rating=rating,
+                           comment=random.choice(comments))
+                db.session.add(r)
+        db.session.commit()
+
+
+if __name__ == '__main__':
+    with app.app_context():
+        init_db()
+    app.run(debug=True, host='0.0.0.0', port=5000)
